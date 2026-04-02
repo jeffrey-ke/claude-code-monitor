@@ -1,0 +1,3 @@
+[submodule "claude-island"]
+	path = claude-island
+	url = https://github.com/jeffrey-ke/claude-island.git
