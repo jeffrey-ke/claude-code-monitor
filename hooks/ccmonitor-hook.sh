@@ -9,9 +9,9 @@ session_id=$(echo "$INPUT" | jq -r '.session_id')
 cwd=$(echo "$INPUT" | jq -r '.cwd // ""')
 
 case "$event" in
-    PreToolUse|PostToolUse|SubagentStart)  state="working" ;;
-    Stop|SubagentStop|SessionStart)        state="idle"    ;;
-    Notification)                          state="blocked" ;;
+    PreToolUse|PostToolUse|SubagentStart|UserPromptSubmit)  state="working" ;;
+    Stop|SubagentStop|SessionStart)                        state="idle"    ;;
+    PermissionRequest)                                     state="blocked" ;;
     *)                                     exit 0          ;;
 esac
 

@@ -1,125 +1,84 @@
-# ccmonitor — Debug Progress & Next Steps
+# ccmonitor — Progress as of 2026-04-02
 
-## What works
+## Current state: hooks backend is live
 
-- **Session discovery**: all live Claude Code sessions found correctly via
-  `~/.claude/sessions/{pid}.json` + `/proc` ancestry walk up to tmux pane PID
-- **`blocked` state**: correctly detected when Claude shows a permission prompt
-  (`esc to cancel` in status bar). Confirmed live with `monitor-plan-test` session.
-- **`idle` state**: correctly detected via `[ctx: XX%]` pattern in status bar
-- **Atomic file output**: `~/.claude/run/status` written correctly
+The hooks backend (`get_sessions_hooks`) is the active backend. It replaced the tmux
+capture-pane scraping approach which had chronic pane-width truncation issues.
 
-## What doesn't work
+### What's deployed
 
-**`working` state is never detected.**
+- **Hook script**: `~/.claude/hooks/ccmonitor-hook.sh` — receives JSON from Claude Code
+  lifecycle events, writes one state file per session to `~/.claude/run/state/{session_id}`
+- **Settings**: `~/.claude/settings.json` has hooks registered for `PreToolUse`,
+  `PostToolUse`, `Stop`, `Notification`, `SessionStart`
+- **Setup script**: `setup.sh` — idempotent, works on a fresh machine. Creates dirs,
+  installs hook, merges hooks into settings.json via `jq` without clobbering existing config
+- **Monitor**: `claude_status.py` with `get_sessions_hooks()` as active backend.
+  Reads state files, looks up session names from `~/.claude/sessions/*.json`,
+  resolves tmux targets via `_find_pane_pid` ancestor walk, writes `~/.claude/run/status`
 
-A session actively running tools (showing `· Metamorphosing…`, `● Reading 1 file…`)
-still classifies as `idle`. The `esc to interrupt` text that should appear in the
-status bar during tool execution is not being captured.
+### What works
 
-## What we know about the status bar
+- **State detection**: `working`, `blocked`, `idle` all detected correctly via hook events
+- **Tmux target resolution**: sessions show as `eval:2.0`, `ipl:1.0`, etc. — jumpable
+  with `tmux switch-client -t <target>`
+- **Stale session cleanup**: dead PIDs pruned automatically (state file deleted if
+  session_id maps to a dead process)
+- **Atomic writes**: both hook state files and status output use tmp + mv/os.replace
 
-Claude Code's status bar sits at the bottom of the TUI. The states we're looking for:
+### Key discovery during implementation
 
-| Visible text | Expected state |
-|---|---|
-| `esc to interrupt` | `working` |
-| `esc to cancel` | `blocked` |
-| `[ctx: XX%]` | `idle` |
+`$PPID` in the hook script is NOT Claude's PID — it's an ephemeral intermediary process
+spawned by Claude Code to run the hook. The real Claude PID comes from
+`~/.claude/sessions/{pid}.json` (the filename IS the PID). The monitor resolves this by
+building a `{session_id: {pid, name}}` index from session files, then matching against
+`session_id` in the hook state files.
 
-The `blocked` case works, which means `capture-pane` CAN see the status bar bottom.
-So `esc to interrupt` is either not appearing, or appearing with different text.
+### Tmux scraping backend (preserved)
 
-## Hypotheses for why `working` isn't detected
+`get_sessions_tmux()` still exists in `claude_status.py`. To revert:
+change `get_sessions = get_sessions_hooks` → `get_sessions = get_sessions_tmux`.
 
-**Hypothesis 1: plan mode vs execute mode have different indicators.**
-The session showed `⏸ plan mode on` in the status bar. While Claude is "thinking"
-in plan mode (`· Slithering…`, `· Metamorphosing…`), the status bar may show
-the plan mode indicator rather than `esc to interrupt`. The `esc to interrupt`
-text may only appear during actual tool execution outside plan mode.
+The scraping backend has known issues:
+- Narrow panes truncate `[ctx: XX%]`, causing false `working` classification
+- `working` detection relies on `↑ N tokens` pattern in pane text, which is fragile
+- Sessions running inside nvim always show `[ctx:` in nvim's statusline, making
+  idle/working ambiguous
 
-**Hypothesis 2: timing — the working state is too brief to poll.**
-Tool execution completes faster than the 2s poll interval. We poll, Claude is
-between tools, we see idle. We need to either poll faster or catch it differently.
+### Reboot survival (as of 2026-04-02)
 
-**Hypothesis 3: `capture-pane` captures scrollback not live screen.**
-Even though `blocked` works (suggesting we can see the bottom), it's possible
-`esc to interrupt` appears somewhere other than where we're looking.
-
-## Next steps to try
-
-**Step 1: capture the raw pane text while working.**
-
-While Claude is actively running a tool (you can see `· Metamorphosing…` or
-`● Reading N files…` in the pane), immediately run:
-
-```bash
-tmux capture-pane -p -t <pane_id> | tail -15
-```
-
-Get the pane_id from:
-```bash
-tmux list-panes -a -F "#{pane_id} #{pane_pid} #{session_name}"
-```
-
-This tells us exactly what text is present during `working` state.
-
-**Step 2: check if plan mode suppresses `esc to interrupt`.**
-
-Try triggering `working` state outside plan mode:
-- Start a Claude session without plan mode (shift+tab to cycle off)
-- Ask it to do something that takes a few seconds (read several files)
-- Immediately capture the pane while it's running
-
-Compare that capture to one taken while in plan mode thinking.
-
-**Step 3: if the text is there but fleeting, reduce poll interval.**
-
-Change `POLL_INTERVAL = 2.0` to `POLL_INTERVAL = 0.5` temporarily and retest.
-If `working` starts appearing intermittently, it's a timing issue.
-
-**Step 4: if text is different in plan mode, add plan mode pattern.**
-
-From the captured pane text, identify what IS shown during plan mode thinking
-and add it as a fourth pattern. Candidate: `· ` (middle dot + space, the
-"thinking" animation prefix), or the plan mode indicator line itself.
-
-## Current claude_status.py classification function
-
-```python
-def _classify_pane(text: str) -> str | None:
-    lower = text.lower()
-    if "esc to interrupt" in lower:
-        return "working"
-    if "esc to cancel" in lower:
-        return "blocked"
-    if re.search(r'\[ctx:\s*\d+%\]', lower) or re.search(r'\d+\.?\d*k?/\d+', lower):
-        return "idle"
-    return None
-```
-
-This is the only function that needs to change to fix `working` detection.
-
-## Session inventory (as of this conversation)
-
-| PID | Name | CWD |
+| Component | Survives reboot? | Manual action? |
 |---|---|---|
-| 793198 | (unnamed) | rollout-visual-servoing |
-| 29144 | (unnamed) | xarm_setup |
-| 4095857 | zed-neural-depth-init | xarm_setup |
-| 492770 | examination of datagen | datagen2_isaacsim |
-| 503632 | (unnamed) | datagen2_isaacsim |
-| 56119 | ipl refactor | rollout-visual-servoing/visual-servo-rollout |
-| 97449 | isaac-sim-claude-role | isaacsim |
+| `~/.claude/hooks/ccmonitor-hook.sh` | Yes (file on disk) | No |
+| `~/.claude/settings.json` (hooks config) | Yes (file on disk) | No |
+| Claude Code sessions | No | User starts them in tmux |
+| Hooks firing | Auto once sessions start | No |
+| **`claude_status.py`** | **No — not daemonized** | **Must start manually** |
+| Stale state files from old sessions | Linger on disk | No — monitor prunes dead PIDs |
+| `~/.claude/run/status` | Stale from before reboot | Overwritten once monitor starts |
 
-New test session: `monitor-plan-test` (created to test blocking/working detection)
+**Only manual step after reboot: start `claude_status.py`.** Failure is silent — status
+file shows stale data with no alert. Fix: systemd user service or tmux auto-launch.
 
-## Key implementation notes
+### Failure modes
 
-- Session files at `~/.claude/sessions/{pid}.json` use key `sessionId` (camelCase)
-- PID in session file is Claude's own PID, not the shell/pane PID
-- Must walk `/proc/{pid}/status` PPid field upward to find ancestor pane PID
-- One session (PID 29144) runs inside nvim — ancestry is `claude → nvim → nvim → bash (pane)`
-- Stop walk when `comm` starts with `tmux` (hits tmux server before reaching init)
-- Filter dead sessions by checking `Path(f"/proc/{pid}").exists()`
-- `capture-pane` without `-S` only captures visible screen — this is correct behavior
+| What dies | Symptom | Detection | Impact |
+|---|---|---|---|
+| Hook script fails | State files stop updating | Timestamps go stale | Monitor shows frozen state. **Silent.** |
+| `claude_status.py` dies | Status file stops updating | File mtime stale | Local consumers see stale data. **Silent.** |
+| tmux server dies | All sessions gone | `list-panes` errors | Monitor writes "(no sessions)". **Visible.** |
+| Claude session ends | No more hook events | State file + dead PID | Monitor prunes it. **Handled.** |
+| SSH connection drops | Local consumer sees nothing | SSH error | **Visible.** |
+| `settings.json` malformed | Hooks don't register | No state files created | Monitor shows nothing. **Silent.** |
+
+**Key risk**: silent staleness. Both "hook dies" and "monitor dies" produce stale-but-
+plausible output. Mitigation: local consumer should check status file mtime and warn
+if older than e.g. 10 seconds.
+
+### Remaining work
+
+1. Make `claude_status.py` persistent (systemd user service — auto-start, auto-restart)
+2. Build local Mac consumer (tmux status line, `watch` + SSH, or Swift notification app)
+3. Local consumer should check status file mtime to detect silent staleness
+4. Sessions already running when hooks are installed don't appear until they fire an event
+   — could add a hybrid fallback or accept the trickle-in behavior

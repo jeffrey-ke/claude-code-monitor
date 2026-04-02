@@ -17,11 +17,12 @@ chmod +x "$HOOK_DST"
 HOOK_CMD="bash $HOOK_DST"
 HOOKS_JSON=$(cat <<'ENDJSON'
 {
-  "PreToolUse":   [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
-  "PostToolUse":  [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
-  "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
-  "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
-  "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}]
+  "PreToolUse":        [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
+  "PostToolUse":       [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
+  "Stop":              [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
+  "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
+  "UserPromptSubmit":  [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}],
+  "SessionStart":      [{"matcher": "", "hooks": [{"type": "command", "command": "PLACEHOLDER"}]}]
 }
 ENDJSON
 )
