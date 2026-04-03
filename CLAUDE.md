@@ -11,6 +11,19 @@ analysis, Swift building blocks, proposed app structure
 **macOS app plan**: see `macos-app-plan.md` (2026-04-02) — implementation plan with
 milestones, file structure, SSH considerations, verification steps
 
+## Long-term vision
+
+Modify [claude-island](https://github.com/farouqaldori/claude-island) (cloned at
+`claude-island/` in this repo) to work with remote Claude Code sessions via SSH.
+
+**Stage 1 — Readonly**: claude-island consumes the status file fetched over SSH,
+displaying remote session states (working/blocked/idle) in the notch UI. The fetch +
+parse layer from ccmonitor replaces claude-island's local Unix socket listener.
+
+**Stage 2 — Interactive**: Send commands to remote sessions from the Mac. Approve
+permissions, send prompts, or interact with blocked sessions — routed over SSH to the
+remote tmux panes. claude-island becomes a full remote control for Claude Code sessions.
+
 ## Files
 
 | File | Purpose |
