@@ -213,12 +213,12 @@ get_sessions = get_sessions_hooks
 
 def write_status(sessions: dict[str, dict]) -> None:
     home = str(Path.home())
-    lines = ["TARGET       STATE    NAME                      CWD"]
+    lines = ["TARGET         STATE    NAME                      CWD"]
     for sid, s in sessions.items():
         cwd    = s["cwd"].replace(home, "~")[-36:]
         name   = (s.get("name") or "")[:24]
         target = s.get("target", "?")
-        lines.append(f"{target:<12} {s['state']:<8} {name:<25} {cwd}")
+        lines.append(f"{target:<14} {s['state']:<8} {name:<25} {cwd}")
     if not sessions:
         lines.append("(no sessions detected)")
 
