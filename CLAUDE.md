@@ -11,6 +11,9 @@ analysis, Swift building blocks, proposed app structure
 **macOS app plan**: see `macos-app-plan.md` (2026-04-02) — implementation plan with
 milestones, file structure, SSH considerations, verification steps
 
+**Stage 1 progress**: see `claude-island/stage1-progress.md` (updated 2026-04-03) —
+SSH fetch + parse verified working end-to-end; column-width fix documented
+
 ## Long-term vision
 
 Modify [claude-island](https://github.com/farouqaldori/claude-island) (cloned at
