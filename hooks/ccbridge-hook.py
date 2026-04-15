@@ -196,20 +196,10 @@ def main():
                 }))
                 sys.exit(0)
 
-        # No bridge running or no response — auto-deny for safety
-        if _read_bridge_port() is not None:
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "deny",
-                        "message": "Bridge connection lost — auto-denied for safety",
-                    },
-                }
-            }))
-            sys.exit(0)
-
-        # No bridge_port file at all — fall through to normal Claude UI
+        # No response from bridge — either:
+        # 1. Couldn't connect (bridge not running) — fall through to local UI
+        # 2. Connected but got no response (user approved locally, socket closed) — fall through
+        # In both cases, exit cleanly and let Claude Code handle it normally.
         sys.exit(0)
 
     elif event == "Notification":
