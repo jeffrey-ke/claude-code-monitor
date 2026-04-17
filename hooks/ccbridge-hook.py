@@ -8,54 +8,14 @@ Also writes state files for claude_status.py compatibility.
 """
 import json
 import os
-import socket
 import sys
 import time
 from pathlib import Path
 
-BRIDGE_PORT_FILE = Path.home() / ".claude" / "run" / "bridge_port"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridge_send import send_event  # noqa: E402
+
 STATE_DIR = Path.home() / ".claude" / "run" / "state"
-TIMEOUT_SECONDS = 300  # 5 minutes for permission decisions
-
-
-# ── Transport ────────────────────────────────────────────────────────────────
-
-def _read_bridge_port():
-    """Read the bridge port from the convention file. Returns None if unavailable."""
-    try:
-        return int(BRIDGE_PORT_FILE.read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def send_event(state):
-    """Send event to Claude Island via TCP. Returns response dict or None.
-
-    This is the single transport function — swap AF_INET for AF_UNIX here
-    to change the transport for the entire hook.
-    """
-    port = _read_bridge_port()
-    if port is None:
-        return None
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT_SECONDS)
-        sock.connect(("127.0.0.1", port))
-        sock.sendall(json.dumps(state).encode())
-
-        # For permission requests, wait for response
-        if state.get("status") == "waiting_for_approval":
-            response = sock.recv(4096)
-            sock.close()
-            if response:
-                return json.loads(response.decode())
-        else:
-            sock.close()
-
-        return None
-    except (socket.error, OSError, json.JSONDecodeError):
-        return None
 
 
 # ── State file (claude_status.py compat) ─────────────────────────────────────

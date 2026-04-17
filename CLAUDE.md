@@ -1,80 +1,77 @@
+---
+description:
+alwaysApply: true
+---
+
 # ccmonitor
 
-Lightweight monitor for active Claude Code sessions running in tmux on a remote Linux server. Writes a plain-text status table to `~/.claude/run/status` for consumption over SSH.
+Remote monitor & control for Claude Code sessions via SSH bridge.
 
-**Progress log**: see `current_progress.md` (updated 2026-04-02) — includes reboot
-survival chart and failure mode analysis
+## Quick start
 
-**macOS app research**: see `macos-app-research.md` (2026-04-02) — notchi/claude-island
-analysis, Swift building blocks, proposed app structure
+The Mac app (claude-island) handles setup automatically:
+1. Open claude-island → notch menu → SSH Bridge → select a host
+2. App establishes reverse SSH tunnel, deploys hooks, writes `bridge_port`
+3. Remote Claude Code sessions appear in the notch within seconds
 
-**macOS app plan**: see `macos-app-plan.md` (2026-04-02) — implementation plan with
-milestones, file structure, SSH considerations, verification steps
-
-**Stage 1 progress**: see `claude-island/stage1-progress.md` (updated 2026-04-03) —
-SSH fetch + parse verified working end-to-end; column-width fix documented
-
-## Long-term vision
-
-Modify [claude-island](https://github.com/farouqaldori/claude-island) (cloned at
-`claude-island/` in this repo) to work with remote Claude Code sessions via SSH.
-
-**Stage 1 — Readonly**: claude-island consumes the status file fetched over SSH,
-displaying remote session states (working/blocked/idle) in the notch UI. The fetch +
-parse layer from ccmonitor replaces claude-island's local Unix socket listener.
-
-**Stage 2 — Interactive**: Send commands to remote sessions from the Mac. Approve
-permissions, send prompts, or interact with blocked sessions — routed over SSH to the
-remote tmux panes. claude-island becomes a full remote control for Claude Code sessions.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `claude_status.py` | Main monitor — polls state files every 2s, writes `~/.claude/run/status` |
-| `hooks/ccmonitor-hook.sh` | Hook script — receives Claude Code lifecycle events, writes per-session state |
-| `setup.sh` | Idempotent setup — installs hook, merges settings.json, creates dirs |
-| `diagnose.py` | Diagnostic tool — dumps raw pane captures and classifier results (tmux backend) |
-| `plan.md` | Original architecture decisions and design constraints |
-| `current_progress.md` | Current state, what works, what's left |
-
-## Architecture (hooks backend, active)
-
-```
-Claude Code session
-    ├─ PreToolUse/PostToolUse  → hook → writes "working"  to ~/.claude/run/state/{sid}
-    ├─ Stop                    → hook → writes "idle"      to ~/.claude/run/state/{sid}
-    ├─ Notification            → hook → writes "blocked"   to ~/.claude/run/state/{sid}
-    ├─ SessionStart            → hook → writes "idle"      to ~/.claude/run/state/{sid}
-    │
-claude_status.py  (polls every 2s)
-    ├─ reads ~/.claude/run/state/*         → state per session
-    ├─ reads ~/.claude/sessions/*.json     → session name, Claude PID
-    ├─ tmux list-panes + _find_pane_pid()  → tmux target (eval:2.0, etc.)
-    │
-    └─→ ~/.claude/run/status  (atomic write, plain text table)
-```
-
-## Setup
-
+For the standalone server-side monitor (no Mac app):
 ```bash
-bash setup.sh    # installs hook, updates settings.json, creates state dir
+bash setup.sh              # install hooks, merge settings.json
+python claude_status.py    # persistent poll loop → ~/.claude/run/status
 ```
 
-Requires `jq`. Restart Claude Code sessions after running for hooks to take effect.
+## Module index
 
-## Running
+| Module | Role | Key exports |
+|---|---|---|
+| `claude_status.py` | Server monitor — polls state files every 2s, resolves tmux targets, writes status table | `get_sessions()`, `write_status()` |
+| `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files | stdin JSON → `~/.claude/run/state/{sid}` |
+| `hooks/ccbridge-hook.py` | Bridge hook — sends events to Mac via TCP, handles permission responses | `send_event()`, hookSpecificOutput JSON |
+| `setup.sh` | Server setup — installs ccmonitor hook, merges settings.json (idempotent) | one-time install |
+| `diagnose.py` | Server diagnostics — dumps pane captures, classifier results | one-shot verification |
+| `claude-island/` | macOS notch app (Swift, git submodule) — displays sessions, approves permissions, sends messages | See `claude-island/CLAUDE.md` |
 
-```bash
-python claude_status.py          # persistent loop
-cat ~/.claude/run/status         # one-shot read
-ssh remote cat ~/.claude/run/status   # from local Mac
-```
+## Data flow
+
+See `.docs_claude/architecture.md` for the full architecture diagram and flows.
 
 ## Key design decisions
 
 - **Three states only**: `working`, `blocked`, `idle`
-- **Plain file output**: atomic write via tmp + `os.replace`
+- **Atomic file writes**: tmp + `os.replace` everywhere
 - **Backend swap**: `get_sessions = get_sessions_hooks` (one line to revert to tmux scraping)
-- **PID resolution**: session files use Claude's PID as filename; ancestor walk finds tmux pane
-- **Stale cleanup**: dead PIDs pruned automatically on each poll
+- **Transport swap**: `send_event()` in ccbridge-hook.py is the single TCP/Unix swap point
+- **Port discovery**: hook reads `~/.claude/run/bridge_port`; missing file = no bridge = exit 0
+- **No hook uninstall**: hooks are harmless when bridge is down (can't connect → exit 0)
+- **Stale tunnel cleanup**: `SSHTunnelManager` kills orphaned `ssh -N` processes on startup
+
+## Where to look next
+
+Documentation, plans, style guidance, and investigation notes live in `.docs_claude/`.
+
+- `.docs_claude/plans/active/` — plans currently in progress
+- `.docs_claude/plans/completed/` — finished plans (includes SSH bridge plan)
+- `.docs_claude/style-and-beliefs/` — code style and design principles
+- `.docs_claude/architecture.md` — system architecture and data flow diagrams
+- `.docs_claude/progress.md` — stage history and what's been built
+- `ssh-bridge-bugs.md` — bugs found during SSH bridge development
+- `claude-island/CLAUDE.md` — Swift app build commands and architecture
+
+## Plans & workflow
+
+Plans are first-class artifacts in `.docs_claude/plans/`.
+
+- **Small change** (one file, obvious fix): no plan needed.
+- **Medium change** (new feature, wire up a subsystem): lightweight plan in `plans/active/`.
+- **Complex change** (new architecture, pipeline redesign): full execution plan with goal, approach, staged checklist, and decision log in `plans/active/`.
+
+Move completed plans to `plans/completed/`.
+
+**Before planning any new implementation:**
+1. Read `plans/active/` — don't duplicate in-progress work.
+2. Read `plans/completed/` — learn from past decisions and avoid re-solving solved problems.
+3. Read relevant docs in `.docs_claude/` — context that shaped the current design.
+
+## Core beliefs
+
+Before planning any implementation, read `/reusable-parts` and apply its guidelines to the design.
