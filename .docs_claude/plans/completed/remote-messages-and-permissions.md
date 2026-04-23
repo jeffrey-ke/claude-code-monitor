@@ -103,6 +103,16 @@ elif event == "Stop":
 
 More complex, higher latency, requires SSH connection management. Only consider if Option A proves insufficient (e.g., JSONL not yet flushed at `Stop` time).
 
+**JSONL-flush race (decided)**: Claude Code may fire the `Stop` hook before the current turn's assistant entry is flushed to the JSONL, in which case a naive tail read returns the *previous* turn's text — displayed in the notch as if it were the current reply. Silent incorrectness is worse than brief silence.
+
+We handle this with a **blocking poll up to a 2s ceiling in the hook**: read the JSONL tail, compare the last assistant entry's `timestamp` against the `Stop` event's timestamp; if stale, sleep ~100ms and re-read. Exit as soon as we observe a fresh entry, or on the 2s ceiling. On ceiling hit, forward a **placeholder message** (`"(assistant message unavailable — see remote terminal for latest reply; JSONL flush timeout)"`) as a normal assistant chat bubble — the notch shows that a reply happened but was not captured. Never forward the stale entry.
+
+Expected added latency: near-zero median (exits as soon as the fresh entry appears), up to 2s in the pathological case.
+
+**Symmetry with `PermissionRequest`**: both hooks exploit Claude Code's synchronous hook execution to *impose* ordering, not merely observe it. `PermissionRequest` holds Claude Code until the user decides; `Stop` holds Claude Code until the JSONL entry is observed. This gives remote assistant-message capture the same confidence level as the `?` indicator.
+
+**Guard against `Notification` messages leaking into chat**: `ccbridge-hook.py` already sets `state["message"] = data.get("message")` for `Notification` events (line ~174). Once we forward `prompt` as `message` on `UserPromptSubmit`, the Swift side must gate chat-append on `event.event ∈ {UserPromptSubmit, Stop}` — otherwise notification text is appended as a chat bubble. Make this an explicit condition in `appendMessageFromHook`, not just an implicit consequence of `messageRole` being nil.
+
 #### 1c. Swift-side: Process message content from hook events
 
 **`HookEvent`** — add one new field:
@@ -155,6 +165,8 @@ Remote sessions won't get `summary` from JSONL parsing. Use the first user messa
 ### Part 2: Permission Request Detail View
 
 **Strategy**: Add an expandable detail section below the `InstanceRow` when waiting for approval. Show the full tool input in a structured, readable format.
+
+**Relationship to the notch header `?` indicator**: `notch-battery-permission-swap` (completed) already replaces the usage battery with an amber `?` icon in the notch header whenever a permission is pending. That `?` is the compact, header-level cue — it stays as-is. `PermissionDetailView` is the *expanded* detail inside `InstanceRow`; the two are complementary, not competing. Don't relocate the `?` or rework `NotchView.shouldShowUsageBattery`.
 
 #### 2a. Permission detail view component
 
@@ -240,19 +252,12 @@ private func fieldPriority(_ field: String) -> Int {
 - [x] Documented in `ssh-bridge-bugs.md` #6
 - [x] Saved as completed plan: `plans/completed/fix-parallel-tool-approval-override.md`
 
-### Stage 1: User messages for remote sessions
-- [ ] `ccbridge-hook.py`: Forward `data["prompt"]` as `state["message"]` in `UserPromptSubmit`
-- [ ] `HookEvent` (Swift): Add `messageRole: String?` field with CodingKey `message_role`
-- [ ] `SessionStore.processHookEvent`: For remote sessions, create `ChatHistoryItem` from hook message
-- [ ] Update `conversationInfo` from hook messages (lastMessage, lastMessageRole, etc.)
-- [ ] Test: send message to remote session, verify it appears in notch chat view
+### Stages 1 + 2: Remote chat content — **COMPLETE ✓**
 
-### Stage 2: Assistant messages for remote sessions
-- [ ] `ccbridge-hook.py`: Add `_read_last_assistant_message()` helper
-- [ ] `ccbridge-hook.py`: In `Stop` branch, read + forward last assistant message
-- [ ] `SessionStore`: Process assistant messages same as user messages (guarded by `isRemote`)
-- [ ] Test: remote Claude responds, verify assistant text appears in notch chat view
-- [ ] Handle edge cases: empty JSONL, partial writes, very long assistant messages (truncate at ~4KB in hook)
+Shipped. See `plans/completed/remote-chat-content.md` for the full summary,
+bugs discovered during verification, and the final file list. Freshness
+detection ended up using UUID-change (not timestamp threshold) after the
+30s window proved too wide for back-to-back turns.
 
 ### Stage 3: Permission detail view
 - [ ] Add `PermissionContext.fullInput` computed property (no truncation, sorted by priority)
@@ -263,10 +268,12 @@ private func fieldPriority(_ field: String) -> Int {
 - [ ] Test: trigger permission request, verify full details visible in notch
 
 ### Stage 4: Polish
-- [ ] Remote session badge (small "SSH" or antenna icon next to session title)
-- [ ] Handle message deduplication if bridge reconnects (use hook event timestamp as ID component)
 - [ ] Truncate very long assistant messages in the chat list (show "..." with expand)
 - [ ] Keyboard shortcut for approve/deny when permission detail is showing
+
+(Moved to Stages 1+2: dedup via `hook-{sessionId}-{role}-{timestampMs}` ID. Not a Stage-4 item any more.)
+
+(Dropped: "remote session SSH badge". Once chat content flows for remote sessions, the content itself is the signal — a badge is low-value polish.)
 
 ## Decision Log
 
@@ -277,6 +284,7 @@ private func fieldPriority(_ field: String) -> Int {
 | Permission details | Expandable inline detail, not separate view | Keeps context — user sees session + details + buttons together |
 | Local session guard | Only create chatItems from hooks for `isRemote` | Local sessions use JSONL parsing; mixing would cause duplicates |
 | JSONL read size | 8KB tail | Last assistant message is rarely >4KB; 8KB gives margin |
+| Stop flush race | Blocking poll in hook up to 2s ceiling; staleness check on last assistant `timestamp`; on ceiling, forward placeholder text (never stale entry) | Makes Stop reliability symmetric with `PermissionRequest` — both hooks impose ordering via synchronous hook execution. Matches user's "same confidence as `?`" requirement. |
 
 ## Files Modified
 

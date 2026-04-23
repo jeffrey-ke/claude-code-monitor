@@ -61,3 +61,17 @@ The state machine can't distinguish "the pending tool was approved" from "some o
 **Impact**: Any session running parallel tools (Agents, concurrent tool calls) will lose permission request visibility if another tool event arrives before the user acts.
 
 **Fix needed**: In `SessionStore.processHookEvent`, when the session is in `.waitingForApproval`, only allow transition to `.processing` if the event's `toolUseId` matches the pending permission's `toolUseId`. Non-matching tool events should be processed (tool tracking, chat items) but should NOT change the phase.
+
+## 7. Zombie `waitingForApproval` chatItems resurrect the phase
+
+**Symptom**: After approving a real permission request in the notch, the notch silently stays in "waiting for approval" for the next ~tens of seconds or until the next legitimate `PermissionRequest`/`Stop` arrives. Unrelated tool events in the window are visibly logged as `Preserving waitingForApproval: ignoring ... for unrelated tool`. The user sees "has a question for me" with nothing actually pending.
+
+**Cause**: A consequence of the #6 fix. When a permission is approved, `processPermissionApproved` asks `findNextPendingTool` (`SessionStore.swift`) whether another tool is waiting. That function scans `session.chatItems` for any `.toolCall` whose `status == .waitingForApproval`. If a prior remote Claude Code session died mid-prompt (terminal killed, network blip, hook crash before `PostToolUse`), its chatItem never transitions away from `.waitingForApproval` — it's a zombie. `findNextPendingTool` returns it, and phase flips to `.waitingForApproval(zombieId)`. No event will ever match `zombieId`, so the #6 guard preserves the phase against every real event until a session-level event (`Stop` / `SessionStart` / `UserPromptSubmit`) arrives.
+
+Parallel leak: `HookSocketServer.pendingPermissions[zombieId]` is also stranded with an open socket for the same reason (visible as a persistent entry in `cancelPendingPermission: ... currentKeys=[<zombieId>]` logs).
+
+**Fix applied**:
+1. `findNextPendingTool` now cross-checks `HookSocketServer.isPermissionLive(toolUseId:)` — a zombie chatItem with no live socket is skipped.
+2. Turn-boundary sweep: on `Stop` / `SessionStart` / `UserPromptSubmit`, any `.waitingForApproval` chatItem without a live socket is re-marked `.interrupted` (`sweepZombieApprovals`). This also cleans up the chat UI so zombie tools don't render as "pending" forever.
+
+The authoritative signal is the live socket in `HookSocketServer.pendingPermissions`, not the chatItem status, because the socket is the only thing the remote hook can actually be blocking on.

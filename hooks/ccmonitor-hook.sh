@@ -15,7 +15,7 @@ case "$event" in
     *)                                     exit 0          ;;
 esac
 
-tmp="$STATE_DIR/${session_id}.tmp"
+tmp="$STATE_DIR/${session_id}.$$.tmp"
 out="$STATE_DIR/${session_id}"
 
 jq -nc \
