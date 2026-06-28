@@ -27,11 +27,16 @@ Session states: `working` (running tools), `blocked` (waiting for permission), `
 ## Server setup
 
 ```bash
-bash setup.sh          # installs hook, updates settings.json, creates dirs
-python claude_status.py  # start the monitor (writes ~/.claude/run/status)
+bash setup.sh             # installs hook, updates settings.json, creates dirs
+python ccstatus.py        # one-shot TSV of every session (pipe-friendly)
+uv run --script ccdash.py # live TUI dashboard (bound to tmux `prefix G`)
+python claude_status.py   # back-compat daemon → ~/.claude/run/status (claude-island)
 ```
 
-Requires `jq`. Restart Claude Code sessions after setup for hooks to take effect.
+`ccstatus.py` is the **provider** (normalized session records from `claude agents
+--json`); `ccdash.py` is the first **consumer** — a Textual TUI that runs in a tmux
+`display-popup` and jumps to a session's pane on `enter`. Requires `jq` (hooks) and
+`uv` (the TUI). Restart Claude Code sessions after setup for hooks to take effect.
 
 ## Status file format
 
