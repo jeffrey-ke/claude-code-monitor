@@ -24,6 +24,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccstatus import get_sessions  # noqa: E402
 
+from rich.console import Group  # noqa: E402
+from rich.rule import Rule  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
@@ -65,7 +67,7 @@ def _capture_pane(pane_id, lines=24):
 class CCDash(App):
     CSS = """
     DataTable { height: 1fr; }
-    #peek { height: 14; border: round $panel; padding: 0 1; color: $text-muted; }
+    #peek { height: 16; border: round $panel; padding: 0 1; color: $text-muted; }
     #filter { dock: bottom; display: none; }
     #filter.-on { display: block; }
     """
@@ -166,6 +168,12 @@ class CCDash(App):
     def on_data_table_row_highlighted(self, _event):
         self._update_peek()
 
+    def _peek_render(self, s, body):
+        """Understanding header + divider + live pane tail."""
+        head = Text(s.understanding or s.synopsis or "(building understanding…)",
+                    style="italic cyan")
+        return Group(head, Rule(style="dim"), Text(body))
+
     def _update_peek(self):
         if not self.peek_on:
             return
@@ -175,15 +183,14 @@ class CCDash(App):
             return
         self.peek.border_title = f"preview · {s.title}"
         if s.pane_id:
-            self._peek_capture(s.pane_id)
+            self._peek_capture(s)
         else:
-            self.peek.update(Text(f"{s.synopsis}\n\n(background session — no tmux pane)",
-                                  style="dim"))
+            self.peek.update(self._peek_render(s, "(background session — no tmux pane)"))
 
     @work(thread=True, exclusive=True, group="peek")
-    def _peek_capture(self, pane_id):
-        text = _capture_pane(pane_id)
-        self.call_from_thread(self.peek.update, text or "(no pane content)")
+    def _peek_capture(self, s):
+        body = _capture_pane(s.pane_id, lines=12) or "(no pane content)"
+        self.call_from_thread(self.peek.update, self._peek_render(s, body))
 
     # ── actions ──────────────────────────────────────────────────────────────
 

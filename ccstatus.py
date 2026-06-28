@@ -60,6 +60,7 @@ class Session:
     age_s: "int | None"         # now − statusUpdatedAt
     model: "str | None" = None
     ctx_pct: "float | None" = None
+    understanding: str = ""     # richer moving-average state behind the synopsis
 
 
 # ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -320,6 +321,12 @@ def get_sessions():
         if jp.exists():
             model, ctx = _transcript_usage(jp)
 
+        understanding = ""
+        try:
+            understanding = (STATE_DIR / f"{sid}.understanding").read_text().strip()
+        except OSError:
+            pass
+
         out.append(Session(
             session_id=sid,
             short_id=sid[:8],
@@ -335,6 +342,7 @@ def get_sessions():
             age_s=age,
             model=model,
             ctx_pct=ctx,
+            understanding=understanding,
         ))
 
     out.sort(key=_sort_key)

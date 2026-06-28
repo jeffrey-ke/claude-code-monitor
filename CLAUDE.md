@@ -32,8 +32,8 @@ sourced from the supported `claude agents --json` API) feeding **consumers** (th
 | Module | Role | Key exports |
 |---|---|---|
 | `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis cache; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
-| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table, pane preview, `enter`=jump via `tmux switch-client -t <pane_id>`; runs in `display-popup` | `CCDash` |
-| `ccsynopsis.py` | **Synopsis** — Stop-hook async summarizer; detached `claude -p` Haiku over the transcript tail (neutral cwd) → `~/.claude/run/state/{sid}.synopsis` | `--worker <sid> <transcript>` |
+| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; peek panel = running understanding header + live pane tail; `enter`=jump via `tmux switch-client -t <pane_id>`; runs in `display-popup` | `CCDash` |
+| `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
 | `hooks/ccbridge-hook.py` | Bridge hook — sends events to Mac via TCP, handles permission responses | `send_event()`, hookSpecificOutput JSON |
@@ -56,9 +56,13 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   versions leave the latter hours stale).
 - **Jump from a popup**: a `display-popup -E` is a pure overlay, so `tmux switch-client
   -t <pane_id>` retargets the underlying client; exiting closes the popup.
-- **Synopsis is async + cached + neutral-cwd**: the Stop hook detaches `claude -p`
-  (Haiku) so it never blocks; the neutral cwd + `--exclude-dynamic-system-prompt-sections`
-  keep the summarized project's CLAUDE.md out of the summarizer's context.
+- **Synopsis is a moving average, not a snapshot**: each Stop step feeds the prior
+  `{sid}.understanding` + title back to Haiku and asks it to evolve them *slowly*, so
+  the name is sticky while the theme holds and lags through momentary tangents. The
+  understanding is the richer hidden state; the title is its sticky projection.
+- **Synopsis is async + neutral-cwd**: the Stop hook detaches `claude -p` (Haiku) so it
+  never blocks; the neutral cwd + `--exclude-dynamic-system-prompt-sections` keep the
+  summarized project's CLAUDE.md out of the summarizer's context.
 - **Five states**: `blocked`, `busy`, `shell`, `idle`, `dead` (mapped back to
   working/blocked/idle by `--serve` for claude-island).
 - **Atomic file writes**: tmp + `os.replace` everywhere; everything fail-open.
