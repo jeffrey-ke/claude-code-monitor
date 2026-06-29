@@ -53,6 +53,13 @@ STATE_STYLE = {
     "dead": "grey50",
 }
 DOT = "●"
+STATE_GLYPH = {                 # shape (not just color) so state reads under the cursorline
+    "blocked": "●",             # strongest mark for needs-you
+    "busy": "◐",
+    "shell": "▸",
+    "idle": "·",
+    "dead": "×",
+}
 SORTS = ["state", "age", "title", "cwd"]   # 'state' = provider order (blocked-first)
 
 # Drive mode: map a Textual key name → the tmux send-keys token. Printable characters
@@ -297,7 +304,11 @@ class CCDash(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        self.table = DataTable(zebra_stripes=True, cursor_type="row")
+        # cursor_foreground_priority="renderable" so the cursorline's blue highlight
+        # keeps its background but no longer overrides each cell's own color — the orange
+        # "needs you" marker stays visible under the cursor.
+        self.table = DataTable(zebra_stripes=True, cursor_type="row",
+                               cursor_foreground_priority="renderable")
         self.peek = Static("", id="peek")
         self.filter_input = Input(placeholder="filter title / synopsis / cwd …", id="filter")
         self.compose_input = Input(placeholder="message / answer …", id="compose")
@@ -375,7 +386,7 @@ class CCDash(App):
         elif s.acknowledged:
             dot, style, title_style = "✓", "dim green", ""   # responded-to: calm, not orange
         else:
-            dot, style = DOT, STATE_STYLE.get(s.state, "")
+            dot, style = STATE_GLYPH.get(s.state, DOT), STATE_STYLE.get(s.state, "")
             title_style = style if s.state == "blocked" else ""
         age_style = "red" if (s.state == "busy" and (s.age_s or 0) > 600) else "dim"
         return (
