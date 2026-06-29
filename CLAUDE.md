@@ -25,15 +25,17 @@ python claude_status.py    # back-compat: == ccstatus.py --serve → ~/.claude/r
 
 The stack is a **provider** (`ccstatus.py`, the single normalized source of truth,
 sourced from the supported `claude agents --json` API) feeding **consumers** (the
-`ccdash.py` TUI today; any tool that reads `ccstatus --json` tomorrow).
+`ccdash.py` TUI and the `ccbar.py` tmux status-line segment today; any tool that reads
+`ccstatus --json` / the `~/.claude/run/status.json` snapshot tomorrow).
 
 ## Module index
 
 | Module | Role | Key exports |
 |---|---|---|
-| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
+| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; CLI `--json`/`--watch`/`--serve`/`--state`; `--serve` writes both the claude-island TSV (`run/status`) and a full-fidelity `Session[]` snapshot (`run/status.json`) | `Session`, `get_sessions()` |
 | `ccsend.py` | **Input mechanism** — deliver an input into a session via tmux `send-keys`; headless-first **outbox** contract `run/outbox/<sid>/<uniq>.json` (`{"type":"text"\|"keys",…}`) any program can write; `enqueue`/`deliver`/`drain` + a `ccsend <sid> "msg"` / `--keys` / `--drain` CLI; fail-open | `enqueue`, `deliver`, `drain` |
 | `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `c`=respond (compose → text+Enter), `v`=drive (keypress→pane passthrough for multi-select/any menu), `p`=full-screen scrollable reader; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; `enter`=jump via `tmux switch-client -t <pane_id>`; drains the outbox each tick; runs in `display-popup` | `CCDash` |
+| `ccbar.py` | **Consumer #2** — tmux `status-right` segment (plain `python3`, stdlib-only so it spawns fast each `status-interval`); reads the `run/status.json` snapshot and prints a *quiet-until-needed* alert: empty unless a session is `blocked` (and not acknowledged/dismissed), then `⛔ <title> +N more`; faint `⚠` if the snapshot is stale (>15s). Replaces the `tmux-dotbar` plugin | `render()`, `main()` |
 | `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Reads the window **since the user's last message** (`turns_since_last_user`) = "what Claude did since I last spoke". Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
@@ -49,8 +51,18 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
 ## Key design decisions
 
 - **Provider / consumer split**: `ccstatus.py` gathers + normalizes (no display
-  opinions); consumers (`ccdash.py`, pipes) own all display/sort/act policy. The TUI
-  is the first usability test of the `Session` contract.
+  opinions); consumers (`ccdash.py`, `ccbar.py`, pipes) own all display/sort/act policy.
+  The TUI is the first usability test of the `Session` contract.
+- **`status.json` is the full-fidelity feed for status-bar consumers**: the existing
+  `run/status` TSV is *lossy* (`SERVE_STATE` collapses `busy`+`shell`→`working` for the
+  notch), so `--serve` also writes the raw `Session[]` as `run/status.json`. Cheap
+  consumers (the tmux bar) read that cached snapshot instead of re-invoking the provider —
+  a fresh `ccstatus --json` per status tick would hammer `claude agents --json`.
+- **The tmux bar is quiet until a session needs you**: `ccbar.py` shows nothing unless a
+  session is `blocked` (and not acknowledged/dismissed), then names the one ccdash floats
+  to the top (blocked, ascending age) with `+N more`. A stale snapshot (dead daemon) shows
+  a faint `⚠`, never a false "all clear". `#` in titles is doubled (`##`) because tmux
+  re-parses `#()` output as a format string.
 - **State from `claude agents --json`**, not pane scraping — the supported API gives
   state + Claude-generated title; the old `_classify_pane` regex heuristic is retired.
 - **Age from transcript mtime**, not `sessions/<pid>.json statusUpdatedAt` (older CLI

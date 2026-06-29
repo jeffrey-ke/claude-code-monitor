@@ -32,6 +32,7 @@ HOME = Path.home()
 RUN = HOME / ".claude" / "run"
 STATE_DIR = RUN / "state"
 STATUS_FILE = RUN / "status"
+STATUS_JSON = RUN / "status.json"   # full-fidelity Session[] snapshot for status-bar consumers
 ACK_DIR = RUN / "ack"            # ~/.claude/run/ack/<sid>        (touch = responded-to)
 DISMISS_DIR = RUN / "dismissed"  # ~/.claude/run/dismissed/<sid>  (touch = hidden in ccdash)
 ROSTER = HOME / ".claude" / "daemon" / "roster.json"
@@ -525,11 +526,23 @@ def _write_status_file(sessions):
     os.replace(tmp, STATUS_FILE)
 
 
+def _write_status_json(sessions):
+    """Persist the raw Session[] contract (same as `--json`) for status-bar consumers
+    that need full state fidelity the claude-island TSV loses via SERVE_STATE."""
+    STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps([asdict(s) for s in sessions]))
+    os.replace(tmp, STATUS_JSON)
+
+
 def _serve(interval):
-    print(f"ccstatus --serve: writing {STATUS_FILE} every {interval}s", file=sys.stderr)
+    print(f"ccstatus --serve: writing {STATUS_FILE} + {STATUS_JSON} every {interval}s",
+          file=sys.stderr)
     while True:
         try:
-            _write_status_file(get_sessions())
+            sessions = get_sessions()
+            _write_status_file(sessions)
+            _write_status_json(sessions)
         except Exception as e:  # never let the daemon die on a transient read
             print(f"ccstatus serve: {e}", file=sys.stderr)
         time.sleep(interval)
