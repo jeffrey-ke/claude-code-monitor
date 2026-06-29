@@ -29,7 +29,7 @@ from pathlib import Path
 # Reuse the provider/sender public seams (stdlib-only; safe under uv's script venv).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccstatus import (  # noqa: E402
-    get_sessions, STATE_ORDER, transcript_path, turns_since_last_user, pending_interaction,
+    get_sessions, transcript_path, turns_since_last_user, pending_interaction,
 )
 from ccsend import enqueue, deliver, drain  # noqa: E402
 
@@ -60,7 +60,25 @@ STATE_GLYPH = {                 # shape (not just color) so state reads under th
     "idle": "·",
     "dead": "×",
 }
+# "Your turn": an idle session Claude has handed back to you (finished a turn, not acked).
+# A softer, separate tier below blocked — distinct glyph + non-bold amber so it doesn't
+# read as the hard-stop permission orange.
+AWAIT_GLYPH = "◆"
+AWAIT_STYLE = "purple"        # purple — distinct from blocked's amber orange
 SORTS = ["state", "age", "title", "cwd"]   # 'state' = provider order (blocked-first)
+
+# Tier rank for the 'state' sort, with "your turn" inserted just below blocked and above
+# the working states (ccstatus's STATE_ORDER has no slot for the derived awaiting tier).
+TIER = {"blocked": 0, "busy": 2, "shell": 3, "idle": 4, "dead": 5}
+
+
+def _awaiting(s):
+    """Idle and handed back to you (not yet acked/dismissed) ⇒ 'your turn'."""
+    return s.state == "idle" and not s.acknowledged and not s.dismissed
+
+
+def _tier(s):
+    return 1 if _awaiting(s) else TIER.get(s.state, 6)
 
 # Drive mode: map a Textual key name → the tmux send-keys token. Printable characters
 # (letters, digits, punctuation) aren't here — they ride event.character and go via `-l`.
@@ -300,7 +318,7 @@ class CCDash(App):
         self.rows = []          # list[Session] in display order; indexed by cursor_row
         self.filter = ""
         self.sort_mode = "state"
-        self.peek_on = True
+        self.peek_on = False    # off by default — P toggles it on
         self.show_dismissed = False
         self._compose_sid = None   # session a just-opened compose box is bound to
 
@@ -311,7 +329,7 @@ class CCDash(App):
         # "needs you" marker stays visible under the cursor.
         self.table = DataTable(zebra_stripes=True, cursor_type="row",
                                cursor_foreground_priority="renderable")
-        self.peek = Static("", id="peek")
+        self.peek = Static("", id="peek", classes="" if self.peek_on else "-off")
         self.filter_input = Input(placeholder="filter title / synopsis / cwd …", id="filter")
         self.compose_input = Input(placeholder="message / answer …", id="compose")
         yield self.table
@@ -348,16 +366,17 @@ class CCDash(App):
             sessions = sorted(sessions, key=lambda s: s.title.lower())
         elif self.sort_mode == "cwd":
             sessions = sorted(sessions, key=lambda s: s.cwd_short.lower())
-        else:  # 'state': blocked-first, but acked/dismissed sink below the live rows
+        else:  # 'state': blocked-first, your-turn next, acked/dismissed sink below the live rows
             sessions = sorted(sessions, key=lambda s: (
                 s.dismissed, s.acknowledged,
-                STATE_ORDER.get(s.state, 5),
+                _tier(s),
                 s.age_s if s.age_s is not None else 1 << 30))
         return sessions
 
     def _apply(self, sessions):
         acked = sum(1 for s in sessions if s.acknowledged)
         hidden = sum(1 for s in sessions if s.dismissed)
+        yours = sum(1 for s in sessions if _awaiting(s))
         sessions = self._ordered(sessions)
         prev = None
         if self.rows and 0 <= self.table.cursor_row < len(self.rows):
@@ -374,6 +393,8 @@ class CCDash(App):
                     self.table.move_cursor(row=i)
                     break
         bits = [f"{len(sessions)} session{'s' * (len(sessions) != 1)}"]
+        if yours:
+            bits.append(f"{yours} your turn")
         if acked:
             bits.append(f"{acked} acked")
         if hidden:
@@ -387,6 +408,8 @@ class CCDash(App):
             dot, style, title_style = "·", "strike grey50", "strike grey50"
         elif s.acknowledged:
             dot, style, title_style = "✓", "dim green", ""   # responded-to: calm, not orange
+        elif s.state == "idle":                              # idle & not acked/dismissed ⇒ your turn
+            dot, style, title_style = AWAIT_GLYPH, AWAIT_STYLE, AWAIT_STYLE
         else:
             dot, style = STATE_GLYPH.get(s.state, DOT), STATE_STYLE.get(s.state, "")
             title_style = style if s.state == "blocked" else ""
@@ -414,6 +437,8 @@ class CCDash(App):
         parts = []
         if s.state == "blocked" and not s.acknowledged:
             parts.append(Text(f"⏳ {s.waiting_for or 'needs you'}", style="bold yellow"))
+        elif _awaiting(s):
+            parts.append(Text("↩ your turn — reply, or `a` to mute", style=AWAIT_STYLE))
         parts.append(Text(s.understanding or s.synopsis or "(building understanding…)",
                           style="italic cyan"))
         parts.append(Rule(style="dim"))
@@ -534,8 +559,8 @@ class CCDash(App):
         self.filter_input.focus()
 
     def action_help(self):
-        self.notify("enter jump · c respond · v drive · p read · P peek · a responded-to · d hide · "
-                    "D show-hidden · / filter · s sort · r refresh · q quit",
+        self.notify("enter jump · c respond · v drive · p read · P peek · a ack (mute your-turn) · "
+                    "d hide · D show-hidden · / filter · s sort · r refresh · q quit",
                     title="ccdash keys", timeout=8)
 
     def _send_compose(self, text):
