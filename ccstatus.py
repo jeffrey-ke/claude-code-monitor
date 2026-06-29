@@ -32,6 +32,8 @@ HOME = Path.home()
 RUN = HOME / ".claude" / "run"
 STATE_DIR = RUN / "state"
 STATUS_FILE = RUN / "status"
+ACK_DIR = RUN / "ack"            # ~/.claude/run/ack/<sid>        (touch = responded-to)
+DISMISS_DIR = RUN / "dismissed"  # ~/.claude/run/dismissed/<sid>  (touch = hidden in ccdash)
 ROSTER = HOME / ".claude" / "daemon" / "roster.json"
 PROJECTS = HOME / ".claude" / "projects"
 
@@ -51,8 +53,8 @@ class Session:
     pid: "int | None"
     kind: str            # interactive | background
     state: str           # blocked | busy | shell | idle | dead
-    title: str           # Claude-generated name, else short_id
-    synopsis: str        # AI cache → roster seed.intent → first user prompt → ""
+    title: str           # Claude name → haiku name → short_id
+    synopsis: str        # understanding → roster seed.intent → first user prompt → ""
     cwd: str
     cwd_short: str        # $HOME → ~
     tmux_target: "str | None"   # e.g. "train:1.0"
@@ -61,6 +63,9 @@ class Session:
     model: "str | None" = None
     ctx_pct: "float | None" = None
     understanding: str = ""     # richer moving-average state behind the synopsis
+    waiting_for: str = ""       # what a waiting/blocked session needs (e.g. "permission prompt")
+    acknowledged: bool = False  # responded-to; auto-clears on new activity
+    dismissed: bool = False     # hidden in ccdash; auto-clears on new activity
 
 
 # ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -232,15 +237,21 @@ def _transcript_usage(jsonl_path):
 def _normalize_state(rec, alive):
     """Collapse the agents-json status/state fields into one state.
 
-    Interactive records carry `status` (busy|idle|shell) and no `state`;
-    background records carry `state` (blocked|…) and sometimes `status`.
-    Permission-blocked wins; a present-but-dead pid is `dead`.
+    Interactive records carry `status` (busy|idle|shell|waiting) and no `state`;
+    background records carry `state` (blocked|done|…) and sometimes `status`.
+    Anything waiting on the user collapses to `blocked` (the actionable top tier):
+    a background `state=blocked`, OR an interactive `status=waiting` — which covers a
+    permission prompt, an AskUserQuestion menu, AND a plan-approval menu (all three are
+    reported identically as status=waiting, waitingFor="permission prompt"; verified live).
+    A present-but-dead pid is `dead`.
     """
     if not alive:
         return "dead"
     if rec.get("state") == "blocked":
         return "blocked"
     status = rec.get("status")
+    if status == "waiting":        # interactive: permission prompt / question / plan menu
+        return "blocked"
     if status in ("busy", "shell", "idle"):
         return status
     state = rec.get("state")
@@ -261,14 +272,20 @@ def _short_cwd(cwd):
     return ("~" + cwd[len(home):]) if cwd.startswith(home) else cwd
 
 
-def _synopsis(sid, cwd, seeds):
-    cache = STATE_DIR / f"{sid}.synopsis"
+def _read_state(sid, suffix):
+    """Read one ~/.claude/run/state/<sid><suffix> cache file, fail-open."""
     try:
-        txt = cache.read_text().strip()
-        if txt:
-            return _oneline(txt)
+        t = (STATE_DIR / f"{sid}{suffix}").read_text().strip()
+        return t or None
     except OSError:
-        pass
+        return None
+
+
+def _synopsis(sid, cwd, seeds, understanding):
+    # Running understanding is the richest summary; else the launch intent, else the
+    # first human prompt. The short haiku title (.synopsis) feeds `title`, not here.
+    if understanding:
+        return _oneline(understanding)
     if sid in seeds:
         return _oneline(seeds[sid])
     jp = _transcript_path(cwd, sid)
@@ -277,6 +294,17 @@ def _synopsis(sid, cwd, seeds):
         if fp:
             return _oneline(fp)
     return ""
+
+
+def _marker_active(dir_, sid, transcript_mtime):
+    """A touch-marker (ack/dismissed) counts only while it is newer than the last
+    transcript activity, so it auto-clears the moment the session writes something new
+    (mtime advances past the mark)."""
+    try:
+        mark = (dir_ / sid).stat().st_mtime
+    except OSError:
+        return False
+    return transcript_mtime is None or mark >= transcript_mtime
 
 
 def _sort_key(s):
@@ -314,18 +342,16 @@ def get_sessions():
         # statusUpdatedAt is not — older versions leave it hours stale.
         age = model = ctx = None
         jp = _transcript_path(cwd, sid)
+        jp_mtime = None
         try:
-            age = int(now - jp.stat().st_mtime)
+            jp_mtime = jp.stat().st_mtime
+            age = int(now - jp_mtime)
         except OSError:
             pass
         if jp.exists():
             model, ctx = _transcript_usage(jp)
 
-        understanding = ""
-        try:
-            understanding = (STATE_DIR / f"{sid}.understanding").read_text().strip()
-        except OSError:
-            pass
+        understanding = _read_state(sid, ".understanding") or ""
 
         out.append(Session(
             session_id=sid,
@@ -333,8 +359,8 @@ def get_sessions():
             pid=pid,
             kind=kind,
             state=_normalize_state(rec, alive),
-            title=rec.get("name") or sid[:8],
-            synopsis=_synopsis(sid, cwd, seeds),
+            title=rec.get("name") or _read_state(sid, ".synopsis") or sid[:8],
+            synopsis=_synopsis(sid, cwd, seeds, understanding),
             cwd=cwd,
             cwd_short=_short_cwd(cwd),
             tmux_target=tmux_target,
@@ -343,6 +369,9 @@ def get_sessions():
             model=model,
             ctx_pct=ctx,
             understanding=understanding,
+            waiting_for=rec.get("waitingFor") or "",
+            acknowledged=_marker_active(ACK_DIR, sid, jp_mtime),
+            dismissed=_marker_active(DISMISS_DIR, sid, jp_mtime),
         ))
 
     out.sort(key=_sort_key)
@@ -385,6 +414,8 @@ def _write_status_file(sessions):
         name = (s.title if s.title != s.short_id else "")[:24]
         target = s.tmux_target or "?"
         state = SERVE_STATE.get(s.state, s.state)
+        if s.acknowledged and state == "blocked":   # responded-to ⇒ stop alerting the notch
+            state = "idle"
         lines.append(f"{target:<14} {state:<8} {name:<25} {cwd}")
     if not sessions:
         lines.append("(no sessions detected)")

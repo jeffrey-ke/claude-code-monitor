@@ -31,8 +31,8 @@ sourced from the supported `claude agents --json` API) feeding **consumers** (th
 
 | Module | Role | Key exports |
 |---|---|---|
-| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis cache; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
-| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; peek panel = running understanding header + live pane tail; `enter`=jump via `tmux switch-client -t <pane_id>`; runs in `display-popup` | `CCDash` |
+| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
+| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; peek panel = running understanding header + live pane tail; `enter`=jump via `tmux switch-client -t <pane_id>`; runs in `display-popup` | `CCDash` |
 | `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
@@ -60,11 +60,24 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   `{sid}.understanding` + title back to Haiku and asks it to evolve them *slowly*, so
   the name is sticky while the theme holds and lags through momentary tangents. The
   understanding is the richer hidden state; the title is its sticky projection.
+- **Title falls back to the Haiku name**: `title = agents name → {sid}.synopsis (Haiku)
+  → short_id`, so sessions Claude Code hasn't auto-named (no approved plan yet) show a
+  readable title instead of an opaque code. The `synopsis` *column* then carries the
+  richer `{sid}.understanding` text so the two columns stay distinct.
+- **Responded-to / dismiss are touch-files that auto-clear on activity**: `ccdash` writes
+  `~/.claude/run/{ack,dismissed}/<sid>`; `ccstatus` derives `acknowledged`/`dismissed` by
+  comparing each marker's mtime against the transcript mtime, so a stale mark clears the
+  moment the session writes something new. `acknowledged` also maps `blocked→idle` in
+  `--serve` (quiets the notch); `dismissed` is ccdash-only (hidden row; `D` reveals).
 - **Synopsis is async + neutral-cwd**: the Stop hook detaches `claude -p` (Haiku) so it
   never blocks; the neutral cwd + `--exclude-dynamic-system-prompt-sections` keep the
   summarized project's CLAUDE.md out of the summarizer's context.
 - **Five states**: `blocked`, `busy`, `shell`, `idle`, `dead` (mapped back to
-  working/blocked/idle by `--serve` for claude-island).
+  working/blocked/idle by `--serve` for claude-island). `blocked` = "needs you": a
+  background `state=blocked` **or** an interactive `status=waiting` — which covers a
+  permission prompt, an AskUserQuestion menu, and a plan-approval menu alike (all three
+  are reported identically as `waitingFor="permission prompt"`, verified live). The reason
+  rides along in `Session.waiting_for` and shows as a yellow "⏳" line in ccdash's peek.
 - **Atomic file writes**: tmp + `os.replace` everywhere; everything fail-open.
 - **Transport swap**: `send_event()` in ccbridge-hook.py is the single TCP/Unix swap point
 - **Port discovery**: hook reads `~/.claude/run/bridge_port`; missing file = no bridge = exit 0
