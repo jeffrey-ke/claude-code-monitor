@@ -272,6 +272,7 @@ class CCDash(App):
     CSS = """
     DataTable { height: 1fr; }
     #peek { height: 16; border: round $panel; padding: 0 1; color: $text-muted; }
+    #peek.-off { display: none; }
     #filter, #compose { dock: bottom; display: none; }
     #filter.-on, #compose.-on { display: block; }
     #compose { border: round $accent; }
@@ -281,6 +282,7 @@ class CCDash(App):
         ("c", "compose", "respond"),          # type a message / single-choice answer → text + Enter
         ("v", "drive", "drive"),              # remote keyboard for the pane (multi-select & any menu)
         ("p", "reader", "read"),              # full-screen scrollable reader
+        ("P", "toggle_peek", "peek"),         # show/hide the inline preview panel
         ("a", "ack", "ack"),                  # toggle responded-to (mutes the orange marker)
         ("d", "dismiss", "dismiss"),          # toggle hide row
         ("D", "toggle_dismissed", "hidden"),  # reveal / re-hide dismissed rows
@@ -507,6 +509,13 @@ class CCDash(App):
         if s:
             self.push_screen(ReaderScreen(s))
 
+    def action_toggle_peek(self):
+        """Show/hide the inline preview panel; the table reclaims the space when hidden."""
+        self.peek_on = not self.peek_on
+        self.peek.set_class(not self.peek_on, "-off")
+        if self.peek_on:
+            self._update_peek()
+
     def action_cycle_sort(self):
         self.sort_mode = SORTS[(SORTS.index(self.sort_mode) + 1) % len(SORTS)]
         self.load()
@@ -525,7 +534,7 @@ class CCDash(App):
         self.filter_input.focus()
 
     def action_help(self):
-        self.notify("enter jump · c respond · v drive · p read · a responded-to · d hide · "
+        self.notify("enter jump · c respond · v drive · p read · P peek · a responded-to · d hide · "
                     "D show-hidden · / filter · s sort · r refresh · q quit",
                     title="ccdash keys", timeout=8)
 
