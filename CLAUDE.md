@@ -31,9 +31,10 @@ sourced from the supported `claude agents --json` API) feeding **consumers** (th
 
 | Module | Role | Key exports |
 |---|---|---|
-| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
-| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; peek panel = running understanding header + live pane tail; `enter`=jump via `tmux switch-client -t <pane_id>`; runs in `display-popup` | `CCDash` |
-| `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
+| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; CLI `--json`/`--watch`/`--serve`/`--state` | `Session`, `get_sessions()` |
+| `ccsend.py` | **Input mechanism** — deliver an input into a session via tmux `send-keys`; headless-first **outbox** contract `run/outbox/<sid>/<uniq>.json` (`{"type":"text"\|"keys",…}`) any program can write; `enqueue`/`deliver`/`drain` + a `ccsend <sid> "msg"` / `--keys` / `--drain` CLI; fail-open | `enqueue`, `deliver`, `drain` |
+| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `c`=respond (compose → text+Enter), `v`=drive (keypress→pane passthrough for multi-select/any menu), `p`=full-screen scrollable reader; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; `enter`=jump via `tmux switch-client -t <pane_id>`; drains the outbox each tick; runs in `display-popup` | `CCDash` |
+| `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Reads the window **since the user's last message** (`turns_since_last_user`) = "what Claude did since I last spoke". Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
 | `hooks/ccbridge-hook.py` | Bridge hook — sends events to Mac via TCP, handles permission responses | `send_event()`, hookSpecificOutput JSON |
@@ -72,6 +73,25 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
 - **Synopsis is async + neutral-cwd**: the Stop hook detaches `claude -p` (Haiku) so it
   never blocks; the neutral cwd + `--exclude-dynamic-system-prompt-sections` keep the
   summarized project's CLAUDE.md out of the summarizer's context.
+- **Summary window = since the user's last message**: `turns_since_last_user` (in `ccstatus`)
+  anchors the summarizer/reader window at the last genuine human turn (type=`user`, not
+  meta/sidechain, prose not a `tool_result`/wrapper), so the understanding reads as "what
+  Claude has done since I last spoke" — the slice you scan before replying. Fail-open: if no
+  user turn is in the tail, it falls back to the last-N turns.
+- **Responding is a file-based outbox, send-keys is the only delivery**: `ccsend` is the
+  mechanism — the representation of an input is a JSON file under `run/outbox/<sid>/`
+  (`{"type":"text"|"keys"}`) that *any* program can write (the ccdash TUI is one writer, the
+  `ccsend` CLI another). Delivery is a single tmux `send-keys` seam (the only reliable way to
+  drive an attached session — same as the Mac app's `ToolApprovalHandler`). `text` = literal
+  text + Enter (a message, or a single-choice digit "1" to accept a plan / answer a question /
+  approve a permission); `keys` = named tmux keys for arbitrary menus. ccdash exposes a compose
+  box (`c`) and a key-passthrough **drive mode** (`v`, for multi-select & any in-terminal menu);
+  it drains the outbox each refresh tick. Fail-open (ssh-bridge-bugs.md #4): never deliver
+  something unparsed, never crash on a tmux error, never blind-retry a partial send.
+- **Reader vs glance peek**: the inline peek is a quick at-a-glance grab; `p` opens a
+  full-screen **scrollable** reader (running understanding + the pending question/plan with its
+  real options + the conversation since your last message, untruncated + the live pane tail)
+  for serious reading.
 - **Five states**: `blocked`, `busy`, `shell`, `idle`, `dead` (mapped back to
   working/blocked/idle by `--serve` for claude-island). `blocked` = "needs you": a
   background `state=blocked` **or** an interactive `status=waiting` — which covers a

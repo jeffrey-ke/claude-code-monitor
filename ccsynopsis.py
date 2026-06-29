@@ -27,6 +27,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Reuse the provider's transcript-window helper (same dir, stdlib-only).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ccstatus import turns_since_last_user  # noqa: E402
+
 RUN = Path.home() / ".claude" / "run"
 STATE_DIR = RUN / "state"
 # An empty directory with no CLAUDE.md, used as the summarizer's cwd so `claude -p`
@@ -36,9 +40,6 @@ MODEL = "claude-haiku-4-5"
 # Set when we shell out to `claude -p`; if that session's own Stop hook fires and
 # re-enters this script, we see the guard and bail — no summarizer-of-a-summarizer.
 GUARD = "CCSYNOPSIS_RUNNING"
-TAIL_BYTES = 128 * 1024
-TURN_MAX = 320          # per-turn char cap fed to the model
-N_TURNS = 6             # how many recent turns to include
 UNDERSTANDING_MAX = 400  # cap on the running-understanding state
 TITLE_MAX = 80           # cap on the short evolving name
 
@@ -70,36 +71,17 @@ PROMPT_TEMPLATE = (
 
 
 def _recent_text(transcript_path):
-    """Last few user/assistant text turns from the transcript tail."""
-    try:
-        size = Path(transcript_path).stat().st_size
-        with open(transcript_path, "rb") as f:
-            f.seek(max(0, size - TAIL_BYTES))
-            tail = f.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    turns = []
-    for line in tail.splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        role = e.get("type")
-        if role not in ("user", "assistant"):
-            continue
-        content = (e.get("message") or {}).get("content")
-        text = None
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = [b.get("text") for b in content
-                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
-            text = " ".join(parts) if parts else None
-        if text and text.strip() and not text.lstrip().startswith("<"):
-            turns.append(f"{role}: {' '.join(text.split())[:TURN_MAX]}")
+    """The turns since the user last spoke — 'what has Claude done since I last responded.'
+
+    Anchoring the window at the last genuine user message (instead of a fixed last-N tail)
+    means each Stop summarizes the work done since the user's last input, which is exactly
+    the slice they read before replying. The slowly-evolving EMA still blends this with the
+    prior understanding upstream in `_evolve`.
+    """
+    turns = turns_since_last_user(transcript_path)
     if not turns:
         return None
-    return "\n".join(turns[-N_TURNS:])
+    return "\n".join(f"{t['role']}: {t['text']}" for t in turns)
 
 
 def _clean(s):

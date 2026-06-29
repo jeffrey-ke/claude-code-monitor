@@ -166,6 +166,11 @@ def _transcript_path(cwd, sid):
     return PROJECTS / _project_dir(cwd) / f"{sid}.jsonl"
 
 
+def transcript_path(cwd, sid):
+    """Public seam: the .jsonl transcript Path for a session (consumers e.g. ccdash reader)."""
+    return _transcript_path(cwd, sid)
+
+
 def _looks_like_wrapper(text):
     """Slash-command / local-command / caveat envelopes — not a real first prompt."""
     t = text.lstrip()
@@ -230,6 +235,101 @@ def _transcript_usage(jsonl_path):
         ctx = round(100 * used / window, 1) if used else None
         return model, ctx
     return None, None
+
+
+def _entry_text(e):
+    """Plain text of a user/assistant transcript entry, or None if it carries no prose
+    (a tool_result-only user turn or a tool_use-only assistant turn yields None)."""
+    content = (e.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+        return " ".join(parts) if parts else None
+    return None
+
+
+def _is_genuine_user(e, text):
+    """A real human-typed turn: a user entry with prose that isn't a meta/sidechain/wrapper
+    envelope. (tool_result turns already fail this — their `text` comes back None.)"""
+    return (e.get("type") == "user" and not e.get("isMeta") and not e.get("isSidechain")
+            and bool(text) and text.strip() and not _looks_like_wrapper(text))
+
+
+def turns_since_last_user(jsonl_path, tail_bytes=512 * 1024, max_turns=40, turn_max=320):
+    """Conversation turns [{'role','text'}] from the last genuine user message to the end —
+    the window you read/respond against ("what has Claude done since I last spoke").
+
+    Fail-open: if no user turn is found in the tail (a very long agent run, or an unreadable
+    file), fall back to the last `max_turns` text turns (the prior last-N behaviour).
+    """
+    try:
+        size = Path(jsonl_path).stat().st_size
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    turns = []           # (role, text)
+    last_user = None     # index into `turns` of the last genuine human message
+    for line in tail.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") not in ("user", "assistant"):
+            continue
+        text = _entry_text(e)
+        if not text or not text.strip():
+            continue
+        if e.get("type") == "user":
+            if not _is_genuine_user(e, text):
+                continue                       # skip tool_result / meta / wrapper user turns
+            last_user = len(turns)
+        turns.append((e.get("type"), " ".join(text.split())[:turn_max]))
+    window = turns[last_user:] if last_user is not None else turns[-max_turns:]
+    return [{"role": r, "text": t} for r, t in window]
+
+
+def pending_interaction(jsonl_path, tail_bytes=256 * 1024):
+    """The AskUserQuestion / ExitPlanMode the agent is currently parked on, so the reader can
+    render the real options/plan instead of raw pane text. Returns None if nothing's pending.
+
+        {'kind': 'question', 'questions': [{question, header, multiSelect, options:[{label,description}]}]}
+        {'kind': 'plan',     'plan': '<markdown>'}
+    """
+    try:
+        size = Path(jsonl_path).stat().st_size
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        t = e.get("type")
+        if t == "user":
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                return None                    # the question was already answered → nothing pending
+            continue
+        if t != "assistant":
+            continue                           # skip mode/ai-title/attachment/etc. between turns
+        for b in (e.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name, inp = b.get("name"), (b.get("input") or {})
+            if name == "AskUserQuestion":
+                return {"kind": "question", "questions": inp.get("questions") or []}
+            if name == "ExitPlanMode":
+                return {"kind": "plan", "plan": inp.get("plan") or ""}
+        return None                            # most recent assistant turn isn't a Q/plan
+    return None
 
 
 # ── Normalization ────────────────────────────────────────────────────────────
