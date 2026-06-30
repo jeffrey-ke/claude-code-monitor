@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccstatus import (  # noqa: E402
     get_sessions, transcript_path, turns_since_last_user, pending_interaction,
+    load_ignore_patterns, is_ignored,
 )
 from ccsend import enqueue, deliver, drain  # noqa: E402
 
@@ -74,8 +75,10 @@ TIER = {"blocked": 0, "busy": 2, "shell": 3, "idle": 4, "dead": 5}
 
 
 def _awaiting(s):
-    """Idle and handed back to you (not yet acked/dismissed) ⇒ 'your turn'."""
-    return s.state == "idle" and not s.acknowledged and not s.dismissed
+    """Idle, Claude has actually responded (engaged), and handed back to you (not yet
+    acked/dismissed) ⇒ 'your turn'. The `engaged` gate keeps a freshly opened, never-answered
+    idle session from showing as a false 'needs you'."""
+    return s.state == "idle" and s.engaged and not s.acknowledged and not s.dismissed
 
 
 def _tier(s):
@@ -375,6 +378,12 @@ class CCDash(App):
         return sessions
 
     def _apply(self, sessions):
+        # Drop ignored sessions up front (reloaded each tick so edits take effect live);
+        # ccbar mirrors this against the same file. The provider still emits them.
+        patterns = load_ignore_patterns()
+        n_ignored = sum(1 for s in sessions if is_ignored(s, patterns))
+        if patterns:
+            sessions = [s for s in sessions if not is_ignored(s, patterns)]
         acked = sum(1 for s in sessions if s.acknowledged)
         hidden = sum(1 for s in sessions if s.dismissed)
         yours = sum(1 for s in sessions if _awaiting(s))
@@ -400,6 +409,8 @@ class CCDash(App):
             bits.append(f"{acked} acked")
         if hidden:
             bits.append(f"{hidden} hidden" + (" (shown)" if self.show_dismissed else ""))
+        if n_ignored:
+            bits.append(f"{n_ignored} ignored")
         bits.append(f"sort:{self.sort_mode}")
         self.sub_title = "  ·  ".join(bits)
         self._update_peek()

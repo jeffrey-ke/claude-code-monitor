@@ -12,11 +12,16 @@ re-interprets) and escapes any literal `#` in dynamic text to `##`.
 """
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 STATUS_JSON = Path.home() / ".claude" / "run" / "status.json"
+# Same ignore file ccdash/ccstatus use; mirrored here (ccbar stays stdlib-only, no provider
+# import) so an ignored session never alerts in the bar either. One regex/line, '#' comments.
+IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE",
+                                  str(Path.home() / ".claude" / "run" / "ccmonitor-ignore")))
 STALE_AFTER_S = 15          # serve writes every ~2s; older than this ⇒ daemon is likely dead
 TITLE_MAX = 28
 MAX_OUT = 200               # hard cap on emitted length — a guard against an absurd snapshot,
@@ -48,10 +53,35 @@ def _load():
 
 
 def _awaiting(s):
-    """Idle and handed back to you (not yet acked/dismissed) ⇒ ccdash's 'your turn' tier.
-    Mirrors ccdash._awaiting so the two consumers agree on the tier definition."""
-    return (s.get("state") == "idle"
+    """Idle, engaged (Claude has responded), handed back to you (not acked/dismissed) ⇒
+    ccdash's 'your turn' tier. Mirrors ccdash._awaiting; the `engaged` gate suppresses a
+    fresh never-answered idle session. Old snapshots lack the key → falsy → no false ◆."""
+    return (s.get("state") == "idle" and s.get("engaged")
             and not s.get("acknowledged") and not s.get("dismissed"))
+
+
+def _load_ignore():
+    """Compiled ignore regexes (mirrors ccstatus.load_ignore_patterns); fail-open to []."""
+    pats = []
+    try:
+        lines = IGNORE_FILE.read_text().splitlines()
+    except OSError:
+        return pats
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            pats.append(re.compile(line, re.IGNORECASE))
+        except re.error:
+            pass
+    return pats
+
+
+def _ignored(s, patterns):
+    """True if any pattern matches the row's kind/title/cwd (mirrors ccstatus.is_ignored)."""
+    return any(p.search(str(s.get(f, "") or ""))
+               for p in patterns for f in ("kind", "title", "cwd_short"))
 
 
 def _segment(rows, glyph, style):
@@ -75,6 +105,9 @@ def render(sessions, stale):
     # Both drop the ones already responded-to or hidden (auto-clear on new provider activity).
     # Skip non-dict rows defensively — a corrupt snapshot must never crash the bar.
     rows = [s for s in sessions if isinstance(s, dict)]
+    patterns = _load_ignore()                       # honor the same ignore file as ccdash
+    if patterns:
+        rows = [s for s in rows if not _ignored(s, patterns)]
     blocked = [s for s in rows
                if s.get("state") == "blocked"
                and not s.get("acknowledged") and not s.get("dismissed")]

@@ -32,10 +32,10 @@ sourced from the supported `claude agents --json` API) feeding **consumers** (th
 
 | Module | Role | Key exports |
 |---|---|---|
-| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; CLI `--json`/`--watch`/`--serve`/`--state`; `--serve` writes both the claude-island TSV (`run/status`) and a full-fidelity `Session[]` snapshot (`run/status.json`) | `Session`, `get_sessions()` |
+| `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; sets `engaged` (transcript has ≥1 assistant turn) so consumers can tell a genuine "your turn" hand-back from a never-answered fresh idle session; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; consumer-side ignore-list helpers `load_ignore_patterns` / `is_ignored` (provider itself never filters); CLI `--json`/`--watch`/`--serve`/`--state`; `--serve` writes both the claude-island TSV (`run/status`) and a full-fidelity `Session[]` snapshot (`run/status.json`) | `Session`, `get_sessions()` |
 | `ccsend.py` | **Input mechanism** — deliver an input into a session via tmux `send-keys`; headless-first **outbox** contract `run/outbox/<sid>/<uniq>.json` (`{"type":"text"\|"keys",…}`) any program can write; `enqueue`/`deliver`/`drain` + a `ccsend <sid> "msg"` / `--keys` / `--drain` CLI; fail-open | `enqueue`, `deliver`, `drain` |
-| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `c`=respond (compose → text+Enter), `v`=drive (keypress→pane passthrough for multi-select/any menu), `p`=full-screen scrollable reader; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; `enter`=jump via `tmux switch-client -t <pane_id>`; drains the outbox each tick; runs in `display-popup` | `CCDash` |
-| `ccbar.py` | **Consumer #2** — tmux `status-right` segment (plain `python3`, stdlib-only so it spawns fast each `status-interval`); reads the `run/status.json` snapshot and prints a *quiet-until-needed* alert across **two tiers**: `⛔ <title> +N more` (bold yellow) for `blocked`, and a separate `◆ <title> +M more` (magenta) for "your turn" (idle, handed back, not acked/dismissed — mirrors ccdash's `_awaiting`); empty when nothing needs you; faint `⚠` if the snapshot is stale (>15s). Output is length-capped + fully fail-open so a corrupt snapshot can't brick the bar. Replaces the `tmux-dotbar` plugin | `render()`, `main()` |
+| `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `c`=respond (compose → text+Enter), `v`=drive (keypress→pane passthrough for multi-select/any menu), `p`=full-screen scrollable reader; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; `enter`=jump via `tmux switch-client -t <pane_id>` (auto-acks a your-turn row); honors the shared `ccmonitor-ignore` regex list (filters rows, `N ignored` count); drains the outbox each tick; runs in `display-popup` | `CCDash` |
+| `ccbar.py` | **Consumer #2** — tmux `status-right` segment (plain `python3`, stdlib-only so it spawns fast each `status-interval`); reads the `run/status.json` snapshot and prints a *quiet-until-needed* alert across **two tiers**: `⛔ <title> +N more` (bold yellow) for `blocked`, and a separate `◆ <title> +M more` (magenta) for "your turn" (idle, handed back, not acked/dismissed — mirrors ccdash's `_awaiting`); empty when nothing needs you; faint `⚠` if the snapshot is stale (>15s); honors the shared `ccmonitor-ignore` regex list (mirrored stdlib-only) so ignored sessions never alert. Output is length-capped + fully fail-open so a corrupt snapshot can't brick the bar. Replaces the `tmux-dotbar` plugin | `render()`, `main()` |
 | `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Reads the window **since the user's last message** (`turns_since_last_user`) = "what Claude did since I last spoke". Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
@@ -53,6 +53,16 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
 - **Provider / consumer split**: `ccstatus.py` gathers + normalizes (no display
   opinions); consumers (`ccdash.py`, `ccbar.py`, pipes) own all display/sort/act policy.
   The TUI is the first usability test of the `Session` contract.
+- **Ignore list is consumer-side, file-based, shared**: `~/.claude/run/ccmonitor-ignore`
+  (override via `$CCMONITOR_IGNORE`) is one regex per line (`#` comments); each pattern is
+  searched case-insensitively against a session's `kind`, `title`, and `cwd` independently
+  (so `^Smoke test` anchors the title, `background` hides that kind, a repo name hides a tree).
+  The **provider never applies it** — `get_sessions()` always emits the full `Session[]` so the
+  notch / `--serve` stay complete; only the display consumers drop matches. `ccdash` filters in
+  `_apply` (shows an `N ignored` count) via `load_ignore_patterns`/`is_ignored`; `ccbar` mirrors
+  the same matcher stdlib-only (no provider import) so an ignored session never alerts in the bar
+  either. Edits take effect live (re-read each tick). Fail-open: a bad pattern or missing file
+  ignores nothing. The file *is* the headless interface — any editor/script writes it.
 - **`status.json` is the full-fidelity feed for status-bar consumers**: the existing
   `run/status` TSV is *lossy* (`SERVE_STATE` collapses `busy`+`shell`→`working` for the
   notch), so `--serve` also writes the raw `Session[]` as `run/status.json`. Cheap
@@ -60,7 +70,9 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   a fresh `ccstatus --json` per status tick would hammer `claude agents --json`.
 - **The tmux bar is quiet until a session needs you**: `ccbar.py` shows nothing unless a
   session needs you, then surfaces **two tiers** — a loud `⛔` (bold yellow) for `blocked`
-  and a softer `◆` (magenta) for "your turn" (idle + handed back, not acked/dismissed) —
+  and a softer `◆` (magenta) for "your turn" (idle + **engaged** + handed back, not
+  acked/dismissed; `engaged` = Claude has produced ≥1 assistant turn, so a freshly opened
+  never-answered idle session isn't a false "needs you") —
   each as its own segment naming the session ccdash floats to the top of that tier (ascending
   age) with `+N more`. The tier predicates are duplicated from ccdash (`_awaiting`) rather
   than imported, keeping ccbar stdlib-only. A stale snapshot (dead daemon) shows a faint `⚠`,
@@ -116,6 +128,9 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   permission prompt, an AskUserQuestion menu, and a plan-approval menu alike (all three
   are reported identically as `waitingFor="permission prompt"`, verified live). The reason
   rides along in `Session.waiting_for` and shows as a yellow "⏳" line in ccdash's peek.
+  The consumer-derived **"your turn"** tier sits just below `blocked`: an `idle` session that
+  is also `engaged` (Claude produced ≥1 assistant turn) and not acked/dismissed — the `engaged`
+  gate excludes a brand-new idle session that was never answered, which `idle` alone can't.
 - **Atomic file writes**: tmp + `os.replace` everywhere; everything fail-open.
 - **Transport swap**: `send_event()` in ccbridge-hook.py is the single TCP/Unix swap point
 - **Port discovery**: hook reads `~/.claude/run/bridge_port`; missing file = no bridge = exit 0

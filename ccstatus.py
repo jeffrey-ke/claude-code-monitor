@@ -22,6 +22,7 @@ never an exception (same philosophy as ccmonitor-statusline.py).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,10 @@ ACK_DIR = RUN / "ack"            # ~/.claude/run/ack/<sid>        (touch = respo
 DISMISS_DIR = RUN / "dismissed"  # ~/.claude/run/dismissed/<sid>  (touch = hidden in ccdash)
 ROSTER = HOME / ".claude" / "daemon" / "roster.json"
 PROJECTS = HOME / ".claude" / "projects"
+# Shared ignore list for the consumers (ccdash + ccbar): one regex per line, '#' comments.
+# The PROVIDER never filters on it — get_sessions() always emits the full Session[] so the
+# notch / --serve stay complete; only the display consumers drop ignored rows.
+IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE", str(RUN / "ccmonitor-ignore")))
 
 # Sort/priority: actionable states float to the top (k9s convention).
 STATE_ORDER = {"blocked": 0, "busy": 1, "shell": 2, "idle": 3, "dead": 4}
@@ -67,6 +72,9 @@ class Session:
     waiting_for: str = ""       # what a waiting/blocked session needs (e.g. "permission prompt")
     acknowledged: bool = False  # responded-to; auto-clears on new activity
     dismissed: bool = False     # hidden in ccdash; auto-clears on new activity
+    engaged: bool = False       # transcript has ≥1 assistant turn (Claude has actually
+                                # responded); gates the consumer "your turn" tier so a fresh
+                                # idle session (never answered) isn't mistaken for a hand-back
 
 
 # ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -211,14 +219,20 @@ def _first_user_prompt(jsonl_path):
 
 
 def _transcript_usage(jsonl_path):
-    """(model, ctx_pct) from the last assistant message. Best-effort, tail-only."""
+    """(model, ctx_pct, engaged) from the last assistant message. Best-effort, tail-only.
+
+    `engaged` is True once any assistant turn is seen — i.e. Claude has produced output at
+    least once. A genuine "your turn" hand-back always ends with an assistant turn (so it's in
+    the tail); a brand-new / never-answered session has none, which is how consumers tell the
+    two idle cases apart.
+    """
     try:
         size = jsonl_path.stat().st_size
         with open(jsonl_path, "rb") as f:
             f.seek(max(0, size - 256 * 1024))
             tail = f.read().decode("utf-8", "replace")
     except OSError:
-        return None, None
+        return None, None, False
     for line in reversed(tail.splitlines()):
         try:
             e = json.loads(line)
@@ -234,8 +248,8 @@ def _transcript_usage(jsonl_path):
                 + usage.get("cache_read_input_tokens", 0))
         window = 1_000_000 if (model and "[1m]" in model) else 200_000
         ctx = round(100 * used / window, 1) if used else None
-        return model, ctx
-    return None, None
+        return model, ctx, True
+    return None, None, False
 
 
 def _entry_text(e):
@@ -412,6 +426,37 @@ def _sort_key(s):
     return (STATE_ORDER.get(s.state, 5), s.age_s if s.age_s is not None else 1 << 30)
 
 
+# ── Ignore list (consumer-side display policy; the provider never applies it) ──
+
+def load_ignore_patterns(path=None):
+    """Compiled regexes from the ignore file: one pattern per line, '#' starts a comment,
+    blank lines skipped. A malformed pattern (or a missing/unreadable file) is skipped
+    fail-open. Consumed by ccdash (and mirrored, stdlib-only, in ccbar)."""
+    path = Path(path) if path is not None else IGNORE_FILE
+    pats = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return pats
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            pats.append(re.compile(line, re.IGNORECASE))
+        except re.error:
+            pass            # ignore a bad pattern rather than break the whole list
+    return pats
+
+
+def is_ignored(s, patterns):
+    """True if any pattern matches the session's kind, title, OR cwd (each searched
+    independently, so `^Smoke test` anchors the title, `background` hides that kind, and a
+    repo name hides a whole tree)."""
+    return any(p.search(field) for p in patterns
+               for field in (s.kind, s.title, s.cwd_short))
+
+
 # ── Assembly ─────────────────────────────────────────────────────────────────
 
 def get_sessions():
@@ -442,6 +487,7 @@ def get_sessions():
         # The transcript mtime is reliable across CLI versions; sessions/<pid>.json
         # statusUpdatedAt is not — older versions leave it hours stale.
         age = model = ctx = None
+        engaged = False
         jp = _transcript_path(cwd, sid)
         jp_mtime = None
         try:
@@ -450,7 +496,7 @@ def get_sessions():
         except OSError:
             pass
         if jp.exists():
-            model, ctx = _transcript_usage(jp)
+            model, ctx, engaged = _transcript_usage(jp)
 
         understanding = _read_state(sid, ".understanding") or ""
 
@@ -473,6 +519,7 @@ def get_sessions():
             waiting_for=rec.get("waitingFor") or "",
             acknowledged=_marker_active(ACK_DIR, sid, jp_mtime),
             dismissed=_marker_active(DISMISS_DIR, sid, jp_mtime),
+            engaged=engaged,
         ))
 
     out.sort(key=_sort_key)
