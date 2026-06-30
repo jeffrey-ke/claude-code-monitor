@@ -22,6 +22,7 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-06-30** — [self-heal-serve-daemon.md](plans/completed/self-heal-serve-daemon.md) `completed` `bugfix`
 - **2026-06-30** — [fix-phantom-mtime-reflag.md](plans/completed/fix-phantom-mtime-reflag.md) `completed` `bugfix`
 - **2026-06-30** — [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md) `completed`
 - **2026-06-30** — [faq-stale-serve-daemon-engaged.md](plans/completed/faq-stale-serve-daemon-engaged.md) `faq` `error`
@@ -46,6 +47,22 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [self-heal-serve-daemon.md](plans/completed/self-heal-serve-daemon.md)
+`plans/completed/` · 2026-06-30
+> Fixes the same "ccdash shows ✓, ccbar still alerts" symptom as a structural cause: the
+> long-lived `ccstatus.py --serve` daemon never reloads its source, so an edit landing
+> while it's running (e.g. [[fix-phantom-mtime-reflag]] itself) strands it on stale
+> bytecode indefinitely, serving wrong `age_s`/`acknowledged` into `run/status.json`
+> forever — exactly the gap [[faq-stale-serve-daemon-engaged]] diagnosed once but left
+> unfixed. The daemon now detects its own source mtime changed and re-execs in place
+> each tick, the same idiom as `SSHTunnelManager`'s stale-tunnel cleanup.
+>
+> **Key changes:**
+> - `+ ccstatus.py` — `_SELF_PATH`/`_SELF_MTIME` module-level baseline (import-time)
+> - `+ ccstatus.py` — `_restart_if_source_changed()` (`os.execv` in place, preserves `sys.argv`)
+> - `~ ccstatus.py` — `_serve()` calls the check once per tick before the write
+> - (operational) — live stale daemon (PID predating both this fix and `08933ed`) killed + relaunched once to bootstrap
 
 ### [fix-phantom-mtime-reflag.md](plans/completed/fix-phantom-mtime-reflag.md)
 `plans/completed/` · 2026-06-30

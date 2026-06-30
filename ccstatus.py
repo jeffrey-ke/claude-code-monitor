@@ -39,6 +39,11 @@ ACK_DIR = RUN / "ack"            # ~/.claude/run/ack/<sid>        (touch = respo
 DISMISS_DIR = RUN / "dismissed"  # ~/.claude/run/dismissed/<sid>  (touch = hidden in ccdash)
 ROSTER = HOME / ".claude" / "daemon" / "roster.json"
 PROJECTS = HOME / ".claude" / "projects"
+# --serve self-heal: a long-lived daemon never reloads source, so it can silently keep
+# running pre-fix logic for as long as it stays up. Captured at import time so the
+# comparison is "changed since this process loaded it" — see _restart_if_source_changed.
+_SELF_PATH = Path(__file__).resolve()
+_SELF_MTIME = _SELF_PATH.stat().st_mtime if _SELF_PATH.exists() else None
 # Shared ignore list for the consumers (ccdash + ccbar): one regex per line, '#' comments.
 # The PROVIDER never filters on it — get_sessions() always emits the full Session[] so the
 # notch / --serve stay complete; only the display consumers drop ignored rows.
@@ -612,10 +617,26 @@ def _write_status_json(sessions):
     os.replace(tmp, STATUS_JSON)
 
 
+def _restart_if_source_changed():
+    """If ccstatus.py's own source has changed on disk since this process loaded it,
+    re-exec in place so --serve picks up the new code without an external restart."""
+    if _SELF_MTIME is None:
+        return
+    try:
+        current = _SELF_PATH.stat().st_mtime
+    except OSError:
+        return  # fail-open: a transient stat() failure shouldn't kill the daemon
+    if current != _SELF_MTIME:
+        print(f"ccstatus --serve: source changed ({_SELF_PATH}), restarting in place",
+              file=sys.stderr)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def _serve(interval):
     print(f"ccstatus --serve: writing {STATUS_FILE} + {STATUS_JSON} every {interval}s",
           file=sys.stderr)
     while True:
+        _restart_if_source_changed()
         try:
             sessions = get_sessions()
             _write_status_file(sessions)
