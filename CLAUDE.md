@@ -35,7 +35,7 @@ sourced from the supported `claude agents --json` API) feeding **consumers** (th
 | `ccstatus.py` | **Provider** — normalized `Session` per live session from `claude agents --json` + tmux/`/proc` (pane id) + roster + synopsis/understanding cache; title falls back name→haiku→code; derives `acknowledged`/`dismissed` from `run/{ack,dismissed}/<sid>` touch-files; transcript helpers `transcript_path` / `turns_since_last_user` / `pending_interaction`; CLI `--json`/`--watch`/`--serve`/`--state`; `--serve` writes both the claude-island TSV (`run/status`) and a full-fidelity `Session[]` snapshot (`run/status.json`) | `Session`, `get_sessions()` |
 | `ccsend.py` | **Input mechanism** — deliver an input into a session via tmux `send-keys`; headless-first **outbox** contract `run/outbox/<sid>/<uniq>.json` (`{"type":"text"\|"keys",…}`) any program can write; `enqueue`/`deliver`/`drain` + a `ccsend <sid> "msg"` / `--keys` / `--drain` CLI; fail-open | `enqueue`, `deliver`, `drain` |
 | `ccdash.py` | **Consumer #1** — Textual TUI (PEP-723 `uv run --script`); blocked-first table; `c`=respond (compose → text+Enter), `v`=drive (keypress→pane passthrough for multi-select/any menu), `p`=full-screen scrollable reader; `a`=responded-to (mutes orange), `d`=hide row, `D`=show-hidden; `enter`=jump via `tmux switch-client -t <pane_id>`; drains the outbox each tick; runs in `display-popup` | `CCDash` |
-| `ccbar.py` | **Consumer #2** — tmux `status-right` segment (plain `python3`, stdlib-only so it spawns fast each `status-interval`); reads the `run/status.json` snapshot and prints a *quiet-until-needed* alert: empty unless a session is `blocked` (and not acknowledged/dismissed), then `⛔ <title> +N more`; faint `⚠` if the snapshot is stale (>15s). Replaces the `tmux-dotbar` plugin | `render()`, `main()` |
+| `ccbar.py` | **Consumer #2** — tmux `status-right` segment (plain `python3`, stdlib-only so it spawns fast each `status-interval`); reads the `run/status.json` snapshot and prints a *quiet-until-needed* alert across **two tiers**: `⛔ <title> +N more` (bold yellow) for `blocked`, and a separate `◆ <title> +M more` (magenta) for "your turn" (idle, handed back, not acked/dismissed — mirrors ccdash's `_awaiting`); empty when nothing needs you; faint `⚠` if the snapshot is stale (>15s). Output is length-capped + fully fail-open so a corrupt snapshot can't brick the bar. Replaces the `tmux-dotbar` plugin | `render()`, `main()` |
 | `ccsynopsis.py` | **Evolving name** — Stop-hook async EMA summarizer; feeds the prior understanding + title back into `claude -p` Haiku (neutral cwd) so the name drifts slowly. Reads the window **since the user's last message** (`turns_since_last_user`) = "what Claude did since I last spoke". Writes `{sid}.understanding` (hidden moving-average state) + `{sid}.synopsis` (sticky name read by ccstatus) | `--worker <sid> <transcript>` |
 | `claude_status.py` | Back-compat shim → `ccstatus.py --serve` (writes `~/.claude/run/status` for claude-island) | `os.execv` |
 | `hooks/ccmonitor-hook.sh` | Server hook — maps lifecycle events to working/idle/blocked state files (legacy; ccstatus no longer reads these) | stdin JSON → `~/.claude/run/state/{sid}` |
@@ -59,10 +59,16 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   consumers (the tmux bar) read that cached snapshot instead of re-invoking the provider —
   a fresh `ccstatus --json` per status tick would hammer `claude agents --json`.
 - **The tmux bar is quiet until a session needs you**: `ccbar.py` shows nothing unless a
-  session is `blocked` (and not acknowledged/dismissed), then names the one ccdash floats
-  to the top (blocked, ascending age) with `+N more`. A stale snapshot (dead daemon) shows
-  a faint `⚠`, never a false "all clear". `#` in titles is doubled (`##`) because tmux
-  re-parses `#()` output as a format string.
+  session needs you, then surfaces **two tiers** — a loud `⛔` (bold yellow) for `blocked`
+  and a softer `◆` (magenta) for "your turn" (idle + handed back, not acked/dismissed) —
+  each as its own segment naming the session ccdash floats to the top of that tier (ascending
+  age) with `+N more`. The tier predicates are duplicated from ccdash (`_awaiting`) rather
+  than imported, keeping ccbar stdlib-only. A stale snapshot (dead daemon) shows a faint `⚠`,
+  never a false "all clear". `#` in titles is doubled (`##`) because tmux re-parses `#()`
+  output as a format string. Defensive by design (it feeds tmux's format parser): non-dict
+  rows skipped, titles coerced + length-capped, total output bounded by `MAX_OUT` with a
+  trailing `RESET`, and `main()` swallows any exception → empty, so a bug can never brick
+  `status-right`.
 - **State from `claude agents --json`**, not pane scraping — the supported API gives
   state + Claude-generated title; the old `_classify_pane` regex heuristic is retired.
 - **Age from transcript mtime**, not `sessions/<pid>.json statusUpdatedAt` (older CLI
@@ -137,6 +143,20 @@ Plans are first-class artifacts in `.docs_claude/plans/`.
 - **Complex change** (new architecture, pipeline redesign): full execution plan with goal, approach, staged checklist, and decision log in `plans/active/`.
 
 Move completed plans to `plans/completed/`.
+
+A topic-organized + chronological index of every plan lives at
+`.docs_claude/PLANS_TOC.md` (per-plan abstract + "Key changes" list).
+
+## Maintaining .docs_claude/PLANS_TOC.md
+When a plan is added, copied, moved, renamed, or deleted:
+1. Find it: `find -L . -path '*/.docs_claude/plans/*' -name '*.md'` (use `-L` / `rg --follow` — worktree copies under `.claude/worktrees/` are duplicates, exclude them).
+2. Read its title + summary to judge purpose and the code section it touches.
+3. Add an entry (`###` link + code-location line + 2–4 sentence abstract + "Key changes" `+`/`~`/`-` list)
+   under EVERY matching topic. A plan MUST appear under ≥1 topic; never drop it; add a new `## Topic` if none fit.
+4. On move/rename/delete, update or remove the existing entry/entries.
+5. Keep topic order stable; group plans by recency within a topic.
+6. Add it to the Chronological index too — date = git creation date
+   (`git log --diff-filter=A --follow --format=%as -- <path> | tail -1`; uncommitted → today); re-sort most-recent first.
 
 **Before planning any new implementation:**
 1. Read `plans/active/` — don't duplicate in-progress work.
