@@ -83,8 +83,14 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   `status-right`.
 - **State from `claude agents --json`**, not pane scraping — the supported API gives
   state + Claude-generated title; the old `_classify_pane` regex heuristic is retired.
-- **Age from transcript mtime**, not `sessions/<pid>.json statusUpdatedAt` (older CLI
-  versions leave the latter hours stale).
+- **Age (and the ack/dismiss auto-clear) from the last *timestamped* transcript turn**, not
+  the file's `st_mtime` and not `sessions/<pid>.json statusUpdatedAt`. `statusUpdatedAt` runs
+  *stale* on older CLIs; raw `st_mtime` runs *ahead* because Claude Code rewrites the JSONL in
+  place for metadata (`ai-title`, `mode`, `file-history-snapshot`, …) with no new turn — that
+  phantom bump both faked a fresh age and raced past an ack marker, re-raising a settled "your
+  turn". The metadata records carry no `timestamp`; the newest timestamped entry
+  (`_transcript_usage` → `last_turn_ts`, with `st_mtime` as fail-open fallback) ignores them
+  while still advancing on a real user/assistant/system turn.
 - **Jump from a popup**: a `display-popup -E` is a pure overlay, so `tmux switch-client
   -t <pane_id>` retargets the underlying client; exiting closes the popup.
 - **Synopsis is a moving average, not a snapshot**: each Stop step feeds the prior
@@ -97,8 +103,10 @@ See `.docs_claude/architecture.md` for the full architecture diagram and flows.
   richer `{sid}.understanding` text so the two columns stay distinct.
 - **Responded-to / dismiss are touch-files that auto-clear on activity**: `ccdash` writes
   `~/.claude/run/{ack,dismissed}/<sid>`; `ccstatus` derives `acknowledged`/`dismissed` by
-  comparing each marker's mtime against the transcript mtime, so a stale mark clears the
-  moment the session writes something new. `acknowledged` also maps `blocked→idle` in
+  comparing each marker's mtime against the last *timestamped* transcript turn (not raw
+  `st_mtime` — see the age note above), so a stale mark clears the moment the session takes a
+  real new turn, but an in-place metadata rewrite no longer falsely re-arms it. `acknowledged`
+  also maps `blocked→idle` in
   `--serve` (quiets the notch); `dismissed` is ccdash-only (hidden row; `D` reveals).
 - **Synopsis is async + neutral-cwd**: the Stop hook detaches `claude -p` (Haiku) so it
   never blocks; the neutral cwd + `--exclude-dynamic-system-prompt-sections` keep the

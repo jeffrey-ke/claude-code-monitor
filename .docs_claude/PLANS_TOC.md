@@ -22,6 +22,9 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-06-30** — [fix-phantom-mtime-reflag.md](plans/completed/fix-phantom-mtime-reflag.md) `completed` `bugfix`
+- **2026-06-30** — [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md) `completed`
+- **2026-06-30** — [faq-stale-serve-daemon-engaged.md](plans/completed/faq-stale-serve-daemon-engaged.md) `faq` `error`
 - **2026-06-29** — [ccdash-your-turn-engaged-fix.md](plans/completed/ccdash-your-turn-engaged-fix.md) `completed`
 - **2026-06-29** — [ccmonitor-ignore-list.md](plans/completed/ccmonitor-ignore-list.md) `completed`
 - **2026-06-29** — [ccdash-jump-autoack-your-turn.md](plans/completed/ccdash-jump-autoack-your-turn.md) `completed`
@@ -43,6 +46,37 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [fix-phantom-mtime-reflag.md](plans/completed/fix-phantom-mtime-reflag.md)
+`plans/completed/` · 2026-06-30
+> Fixes a session that kept re-surfacing in the "your turn" tier (ccbar `◆` / ccdash) hours
+> after it was acked, with no genuine hand-back. Root cause: Claude Code rewrites the
+> transcript JSONL in place to update metadata (`ai-title`, `mode`, `file-history-snapshot`),
+> bumping the file's `st_mtime` to "now" with no new turn. `ccstatus.py` keyed both `age` and
+> the ack/dismiss auto-clear (`_marker_active`) off raw `st_mtime`, so each phantom rewrite
+> faked a fresh age and raced past the ack marker, re-arming the tier. Switches the activity
+> clock to the newest *timestamped* transcript turn (metadata records carry no `timestamp`),
+> with `st_mtime` as a fail-open fallback.
+>
+> **Key changes:**
+> - `+ ccstatus.py` — `_parse_ts(ts)` helper (ISO-8601 'Z' → epoch, comparable to marker mtime)
+> - `~ ccstatus.py` — `_transcript_usage` also returns `last_turn_ts` (newest timestamped entry, same tail-walk)
+> - `~ ccstatus.py` — `get_sessions()` uses `activity_mtime = last_turn_ts or jp_mtime` for `age` and both `_marker_active` calls
+> - `~ CLAUDE.md` — age + responded-to/dismiss design notes updated (last timestamped turn, not raw `st_mtime`)
+
+### [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md)
+`plans/completed/` · 2026-06-30
+> Fixes opaque session titles like `refseg-workspace-c8` / `ccmonitor-d8`. These are Claude
+> Code's own default placeholder `name` (`<cwd-basename>-<short-hash>`) from `claude agents
+> --json`, not Haiku or `short_id`. Because that `name` is never empty, the old title chain
+> (`name → synopsis → short_id`) made the `.synopsis` branch dead code, masking good Haiku
+> names that already existed. Reorders the fallback to put the Haiku synopsis first, so a
+> session shows its summarized name whenever one exists. Tradeoff: real Claude-Code titles are
+> also overridden by the Haiku name.
+>
+> **Key changes:**
+> - `~ ccstatus.py` — title fallback `name → synopsis → short_id` ⇒ `synopsis → name → short_id`
+> - `~ ccstatus.py` — `Session.title` contract comment updated to `haiku name → Claude name → short_id`
 
 ### [ccstatus-provider-ccdash-tui.md](plans/completed/ccstatus-provider-ccdash-tui.md)
 `plans/completed/` · 2026-06-28
@@ -88,6 +122,19 @@ their tmux wiring.
 > - `~ ccstatus.py` — `_transcript_usage` returns `(model, ctx, engaged)`; `Session.engaged` field; populate in `get_sessions`
 > - `~ ccdash.py` — `_awaiting` requires `s.engaged`
 > - `~ ccbar.py` — `_awaiting` requires `s.get("engaged")` (snapshot-driven, fail-quiet on old snapshots)
+
+### [faq-stale-serve-daemon-engaged.md](plans/completed/faq-stale-serve-daemon-engaged.md) `faq` `error`
+`plans/completed/` · 2026-06-30
+> Postmortem of a confusing operational symptom: ccdash/notch showed a session needing
+> attention but ccbar's `◆` "your turn" segment never appeared. Root cause was a ~24h-old
+> `ccstatus.py --serve` daemon serving pre-`engaged` code — its `status.json` omitted the
+> `engaged` key, so ccbar's `_awaiting` (`s.get("engaged")` → `None` → falsy) permanently
+> suppressed the tier. Not a code regression and not caused by running ccdash; the fix is to
+> restart the daemon (killing the tmux *session* didn't signal the process). See topic 1.
+>
+> **Key changes:**
+> - (no code) — operational fix: `pkill -f 'ccstatus.py --serve'` + relaunch so the snapshot carries the current schema
+> - possible hardening (deferred): `ccbar` show `⚠` on a *schema-stale* snapshot (rows lack `engaged`), not just a time-stale one
 
 ### [ccmonitor-ignore-list.md](plans/completed/ccmonitor-ignore-list.md)
 `plans/completed/` · 2026-06-29
@@ -148,6 +195,17 @@ their tmux wiring.
 
 The Stop-hook Haiku summarizer that evolves a sticky per-session name and a richer hidden
 "understanding" as a moving average.
+
+### [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md)
+`plans/completed/` · 2026-06-30
+> Promotes the Haiku `.synopsis` to be the primary source of a session's display title. The
+> old order let Claude Code's never-empty placeholder `name` (`<cwd-basename>-<short-hash>`)
+> win first, so the summarizer's good names were never shown. Reordering the title fallback to
+> `synopsis → name → short_id` makes the Stop-hook summary the visible name whenever it exists.
+> See topic 1 for the full title-derivation context.
+>
+> **Key changes:**
+> - `~ ccstatus.py` — title fallback reordered so `.synopsis` (Haiku) wins over the agents `name`
 
 ### [ccstatus-provider-ccdash-tui.md](plans/completed/ccstatus-provider-ccdash-tui.md)
 `plans/completed/` · 2026-06-28

@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 HOME = Path.home()
@@ -59,7 +60,7 @@ class Session:
     pid: "int | None"
     kind: str            # interactive | background
     state: str           # blocked | busy | shell | idle | dead
-    title: str           # Claude name → haiku name → short_id
+    title: str           # haiku name → Claude name → short_id
     synopsis: str        # understanding → roster seed.intent → first user prompt → ""
     cwd: str
     cwd_short: str        # $HOME → ~
@@ -218,13 +219,30 @@ def _first_user_prompt(jsonl_path):
     return None
 
 
+def _parse_ts(ts):
+    """ISO-8601 transcript timestamp (UTC 'Z') → epoch seconds, or None. Comparable to a
+    marker file's absolute st_mtime."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _transcript_usage(jsonl_path):
-    """(model, ctx_pct, engaged) from the last assistant message. Best-effort, tail-only.
+    """(model, ctx_pct, engaged, last_turn_ts) from the transcript tail. Best-effort, tail-only.
 
     `engaged` is True once any assistant turn is seen — i.e. Claude has produced output at
     least once. A genuine "your turn" hand-back always ends with an assistant turn (so it's in
     the tail); a brand-new / never-answered session has none, which is how consumers tell the
     two idle cases apart.
+
+    `last_turn_ts` is the epoch of the newest *timestamped* entry (a real user/assistant/system
+    turn). Mutable metadata records Claude Code rewrites in place — `ai-title`, `mode`,
+    `file-history-snapshot`, … — carry no `timestamp`, so they don't advance it. This makes it
+    the true "last activity" clock, unlike the file's st_mtime which a metadata-only rewrite
+    bumps to "now" without any new turn.
     """
     try:
         size = jsonl_path.stat().st_size
@@ -232,24 +250,29 @@ def _transcript_usage(jsonl_path):
             f.seek(max(0, size - 256 * 1024))
             tail = f.read().decode("utf-8", "replace")
     except OSError:
-        return None, None, False
+        return None, None, False, None
+    model = ctx = last_ts = None
+    engaged = False
     for line in reversed(tail.splitlines()):
         try:
             e = json.loads(line)
         except ValueError:
             continue
-        if e.get("type") != "assistant":
-            continue
-        msg = e.get("message") or {}
-        model = msg.get("model")
-        usage = msg.get("usage") or {}
-        used = (usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0))
-        window = 1_000_000 if (model and "[1m]" in model) else 200_000
-        ctx = round(100 * used / window, 1) if used else None
-        return model, ctx, True
-    return None, None, False
+        if last_ts is None:
+            last_ts = _parse_ts(e.get("timestamp"))      # newest timestamped turn wins
+        if not engaged and e.get("type") == "assistant":
+            msg = e.get("message") or {}
+            model = msg.get("model")
+            usage = msg.get("usage") or {}
+            used = (usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0))
+            window = 1_000_000 if (model and "[1m]" in model) else 200_000
+            ctx = round(100 * used / window, 1) if used else None
+            engaged = True
+        if engaged and last_ts is not None:
+            break
+    return model, ctx, engaged, last_ts
 
 
 def _entry_text(e):
@@ -483,20 +506,27 @@ def get_sessions():
                 pane_id, tmux_target = panes[ppid]
 
         cwd = rec.get("cwd") or ""
-        # Age = seconds since the transcript was last appended (i.e. last activity).
-        # The transcript mtime is reliable across CLI versions; sessions/<pid>.json
-        # statusUpdatedAt is not — older versions leave it hours stale.
+        # Age = seconds since the last real turn. We prefer the newest *timestamped* entry in
+        # the transcript over the file's st_mtime: Claude Code rewrites the JSONL in place to
+        # update metadata (ai-title, mode, file-history-snapshot, …), which bumps st_mtime to
+        # "now" with no new turn — that phantom bump otherwise both fakes a fresh age and clears
+        # an ack the user set earlier (mtime races past the marker), re-raising a settled "your
+        # turn". The last timestamped turn ignores those rewrites; st_mtime is the fallback.
+        # (sessions/<pid>.json statusUpdatedAt is unusable — older CLI versions leave it stale.)
         age = model = ctx = None
         engaged = False
+        last_ts = None
         jp = _transcript_path(cwd, sid)
         jp_mtime = None
         try:
             jp_mtime = jp.stat().st_mtime
-            age = int(now - jp_mtime)
         except OSError:
             pass
         if jp.exists():
-            model, ctx, engaged = _transcript_usage(jp)
+            model, ctx, engaged, last_ts = _transcript_usage(jp)
+        activity_mtime = last_ts if last_ts is not None else jp_mtime
+        if activity_mtime is not None:
+            age = int(now - activity_mtime)
 
         understanding = _read_state(sid, ".understanding") or ""
 
@@ -506,7 +536,7 @@ def get_sessions():
             pid=pid,
             kind=kind,
             state=_normalize_state(rec, alive),
-            title=rec.get("name") or _read_state(sid, ".synopsis") or sid[:8],
+            title=_read_state(sid, ".synopsis") or rec.get("name") or sid[:8],
             synopsis=_synopsis(sid, cwd, seeds, understanding),
             cwd=cwd,
             cwd_short=_short_cwd(cwd),
@@ -517,8 +547,8 @@ def get_sessions():
             ctx_pct=ctx,
             understanding=understanding,
             waiting_for=rec.get("waitingFor") or "",
-            acknowledged=_marker_active(ACK_DIR, sid, jp_mtime),
-            dismissed=_marker_active(DISMISS_DIR, sid, jp_mtime),
+            acknowledged=_marker_active(ACK_DIR, sid, activity_mtime),
+            dismissed=_marker_active(DISMISS_DIR, sid, activity_mtime),
             engaged=engaged,
         ))
 
