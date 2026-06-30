@@ -15,7 +15,8 @@ Designed to run inside a tmux popup:
 Keys (also in the footer):  enter/o jump · c respond · v drive · p read · a responded-to ·
 d hide · D show-hidden · / filter · s sort · r refresh · ? help · q quit
 Permission-blocked sessions sort to the top. `enter` switches the underlying tmux client
-to the selected session's pane and closes the popup. `c` opens a compose box that types a
+to the selected session's pane and closes the popup (and auto-acks a "your turn" row —
+visiting it counts as handling it; a blocked row keeps alerting). `c` opens a compose box that types a
 message / menu answer into the session (then Enter); `v` opens drive mode (your keypresses
 go straight to the pane — for multi-select and any in-terminal menu); `p` opens a full-screen
 scrollable reader. `a` mutes a stale orange marker (auto-returns on new activity); `d` hides
@@ -479,6 +480,8 @@ class CCDash(App):
         except (OSError, subprocess.SubprocessError):
             self.notify("tmux switch-client failed", severity="error")
             return
+        if _awaiting(s):                      # visiting a "your turn" session = handling it;
+            _touch(ACK_DIR, s.session_id)     # blocked (⛔) stays alerting until truly resolved
         self.exit()
 
     def action_ack(self):
