@@ -22,6 +22,7 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-07-03** — [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md) `active`
 - **2026-07-01** — [remote-sync-health.md](plans/completed/remote-sync-health.md) `completed`
 - **2026-07-01** — [ccdash-remote-session-monitor.md](plans/completed/ccdash-remote-session-monitor.md) `completed`
 - **2026-06-30** — [synopsis-no-anchor-on-low-confidence.md](plans/active/synopsis-no-anchor-on-low-confidence.md) `active` `bugfix`
@@ -51,6 +52,26 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md)
+`plans/active/` · 2026-07-03 · `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `tests/`
+> Fixes the two remote-monitoring flakiness classes: the intermittently-flashing red `⚠psc`
+> (single slow ssh ticks misclassified `unreachable` with zero debounce) and orange ghost
+> rows for closed psc sessions (bare `/proc` pid check vs multi-login-node pid recycling).
+> The verdict becomes *data*: ccremote's pure `make_health` ladder writes
+> `ok|degraded|down` into a v2 sidecar (degraded = quiet-ish, rows kept; down = red after 3
+> fails/25s), consumers collapse onto one shared `read_verdict` with thresholds scaled to
+> the sidecar's self-description, `_alive` gains a uid+comm identity check, and ccdash acks
+> remote rows optimistically. Adds the pytest suite (`tests/`). Also under topic 4.
+>
+> **Key changes:**
+> - `~ ccremote.py` — pure primitives, sidecar v2 + hysteresis ladder, `timeout` class,
+>   SSH_TIMEOUT 20, threaded `sync_once`, `$CCMONITOR_REMOTE_DIR`
+> - `~ ccstatus.py` — `read_verdict` (shared trust rule), verdict-gated loaders,
+>   identity-checked `_alive` (+`_proc_identity_ok`)
+> - `~ ccbar.py` — stdlib `_read_verdict` mirror; degraded ≠ red; `~ ccdash.py` —
+>   `_health_line` dim-degraded/red-down + optimistic `_ack_overlay`
+> - `+ tests/` — test_ccremote / test_read_verdict (both copies) / test_alive
 
 ### [remote-sync-health.md](plans/completed/remote-sync-health.md)
 `plans/completed/` · 2026-07-01 · `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `ccremote-up.sh`
@@ -368,6 +389,27 @@ The file-based outbox contract and the single tmux `send-keys` delivery seam tha
 The reverse-SSH-tunnel transport that lets the Mac notch app monitor and control remote Linux
 Claude Code sessions, and the message/permission content that rides it — plus the *opposite
 axis*, one Linux box's Python consumers mirroring another host's sessions over SSH.
+
+### [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md)
+`plans/active/` · 2026-07-03 · touches `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `tests/`
+> The robustness follow-up to [[remote-sync-health]] after its loudness proved *too* loud:
+> single slow ssh execs on a healthy psc (a successful exec measured at 12.8s during a
+> busy-login-node episode) blew the 8s timeout, were misclassified `unreachable`, and went
+> red instantly — while closed psc sessions haunted the dashboard orange because a bare
+> `/proc/<pid>` existence check can't survive pid recycling across bridges2's shared-$HOME/
+> per-node-/proc login nodes. Moves the verdict writer-side as sidecar-v2 *data* (pure
+> `make_health` hysteresis ladder: degraded → down only after 3 fails/25s/auth×2), collapses
+> the consumers' triplicated policy onto one `read_verdict` with self-scaling thresholds,
+> identity-checks `_alive` (uid + claude/node comm; false-dead beats false-blocked), adds
+> ccdash's optimistic remote-ack overlay, and introduces `tests/`.
+>
+> **Key changes:**
+> - `~ ccremote.py` — primitives + sidecar v2 (`state`, `bad_since`, `remote_mtimes` ring →
+>   `remote_write_cadence_s`), `timeout`/`write-failed` classes, threaded `sync_once`
+> - `~ ccstatus.py` — `read_verdict`/`_sidecar_verdict`, verdict-gated `load_remote_sessions`
+>   + `load_remote_health` `{state,error,age_s,since}`, `_proc_identity_ok` in `_alive`
+> - `~ ccbar.py` / `~ ccdash.py` — stdlib verdict mirror / dim-degraded + red-down lines,
+>   `_ack_overlay`; `+ tests/` — 75 tests incl. the two-copy lockstep table
 
 ### [remote-sync-health.md](plans/completed/remote-sync-health.md)
 `plans/completed/` · 2026-07-01 · touches `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `ccremote-up.sh`
