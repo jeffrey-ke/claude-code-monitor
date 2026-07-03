@@ -12,14 +12,25 @@ the remote's own `ccstatus.py --serve` already writes — and drops it verbatim 
 syncer that stops updating goes stale and its rows are dropped (no schema translation needed —
 the snapshot is already the portable `Session` contract).
 
-Beside each mirror it writes a `<host>.health` sidecar every tick (success or failure):
-`{synced_at, ok, error, consecutive_failures, remote_status_age_s, sessions}`. The age is
+Beside each mirror it writes a `<host>.health` sidecar every tick (success or failure) — the
+v2 schema carries a *verdict* computed here, once, so the consumers read state instead of
+re-deriving it:
+
+  {"v": 2, "synced_at": …, "state": "ok|degraded|down", "ok": …, "error": …,
+   "consecutive_failures": …, "bad_since": …, "interval_s": …, "ssh_timeout_s": …,
+   "remote_status_age_s": …, "remote_mtimes": […], "remote_write_cadence_s": …,
+   "sessions": …}
+
+`state` applies the hysteresis ladder (one slow tick = "degraded", quiet-ish; confirmed
+outage = "down", loud) so a single 10s ssh stall can't paint the bar red. The age is
 measured with a sentinel header in the same ssh exec — `date +%s` and the file's mtime both
 on the *remote's* clock, so it's skew-free — which catches the phantom-fresh failure where
 the remote's `ccstatus --serve` died but `ssh cat` keeps happily re-mirroring the frozen
-file. `error` classifies the failure ('auth' = control master gone, rerun ccremote-up.sh;
-'unreachable'; 'no-file'; 'garbled') so the consumers can warn loudly instead of rows just
-silently vanishing.
+file. The ring of distinct remote mtimes yields `remote_write_cadence_s` (median write
+interval), letting consumers scale the frozen-content threshold to how fast that host
+actually writes. `error` classifies the failure ('auth' = control master gone, rerun
+ccremote-up.sh; 'timeout'; 'unreachable'; 'no-file'; 'garbled'; 'write-failed') so the
+consumers can warn loudly instead of rows just silently vanishing.
 
 Config (the headless interface): `~/.claude/run/ccmonitor-remotes` (override `$CCMONITOR_REMOTES`),
 one `host` or `user@host` per line, `#` starts a comment, blank lines skipped. Missing file ⇒
@@ -44,14 +55,18 @@ import argparse
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HOME = Path.home()
 RUN = HOME / ".claude" / "run"
-REMOTE_DIR = RUN / "remote"
+# Local mirror dir (override $CCMONITOR_REMOTE_DIR — lets a worktree/test run a fully
+# isolated syncer + consumers without touching the live daemon's files).
+REMOTE_DIR = Path(os.environ.get("CCMONITOR_REMOTE_DIR", str(RUN / "remote")))
 REMOTES_FILE = Path(os.environ.get("CCMONITOR_REMOTES", str(RUN / "ccmonitor-remotes")))
 # Default path of the snapshot on the *remote* host (ssh expands ~). Override globally with
 # $CCMONITOR_REMOTE_STATUS, or per-host with a second whitespace-separated field in the hosts
@@ -62,7 +77,21 @@ REMOTE_ACK = "~/.claude/run/ack"               # ack dir on the remote (fixed; n
                                                # status.json path) — ssh expands ~
 _SID_OK = re.compile(r"[A-Za-z0-9._-]+")       # a session id is a UUID-ish token; reject anything
                                                # else before it reaches a remote shell command
-SSH_TIMEOUT = 8                                # subprocess wall-clock ceiling per host
+SSH_TIMEOUT = 20               # subprocess wall-clock ceiling per host. Healthy-psc execs were
+                               # measured completing after 12.8s during a slow episode (busy login
+                               # node) — the old 8s read every such stall as a failure. 20 turns
+                               # slow ticks into slow successes; it only needs to bound a genuinely
+                               # wedged exec, since sync_once runs hosts in parallel (a slow host
+                               # never delays the others) and TCP-level failures still die at
+                               # ConnectTimeout=5.
+
+# Hysteresis ladder constants — one slow/failed tick is a blip, not an outage. Consumers only
+# go red on state=="down"; "degraded" keeps rows rendered and stays quiet(ish).
+DOWN_AFTER_FAILS = 3           # 3 consecutive failed ticks confirm an outage …
+DOWN_AFTER_BAD_S = 25.0        # … or a failure streak this old, whichever comes first
+AUTH_DOWN_AFTER_FAILS = 2      # auth can't self-heal (password host, dead master) — confirm
+                               # once to rule out a transient misread, then get loud fast
+CADENCE_RING = 8               # distinct remote mtimes kept for the write-cadence estimate
 
 # ControlMaster/ControlPersist reuse one TCP+auth connection across polls, so a 3s cadence is
 # cheap (no fresh handshake each tick). The control socket lives under the remote dir. The
@@ -81,6 +110,13 @@ HEALTH_SUFFIX = ".health"      # per-host sidecar beside the mirror — delibera
 # remote provider stays visible even though `ssh cat` keeps succeeding and the local mirror
 # mtime stays fresh.
 _AGE_HDR = "#cc# "
+
+# stderr evidence for classify_ssh_failure. Substring matches against ssh's own messages —
+# keep them specific: remote login noise (psc's .bashrc prints to stderr) rides along in the
+# same stream, so a loose pattern would misclassify a healthy fetch.
+_AUTH_PATTERNS = ("permission denied", "authentication", "host key verification")
+_UNREACHABLE_PATTERNS = ("could not resolve", "timed out", "connection refused",
+                         "no route", "network is unreachable")
 
 # --serve self-heal (same idiom as ccstatus.py): a long-lived daemon never reloads its own
 # source, so capture the mtime at import and re-exec in place if the file changes on disk.
@@ -120,6 +156,10 @@ def _host_file(host):
     return REMOTE_DIR / f"{safe}.json"
 
 
+def _health_file(host):
+    return _host_file(host).with_suffix(HEALTH_SUFFIX)
+
+
 def _master_gone(host):
     """True if the shared ControlMaster for `host` is down. BatchMode can't answer a password
     prompt, so a dead master on a password-auth host means every fetch fails until the user
@@ -132,100 +172,187 @@ def _master_gone(host):
         return True
 
 
-def _fetch(host, remote_status=REMOTE_STATUS):
-    """Return (payload, remote_age_s, error): the remote status.json text, the file's age
-    measured entirely on the *remote's* clock (skew-free; None if unmeasurable), and a short
-    error class ('auth' | 'unreachable' | 'no-file') when the payload is None. One ssh
-    round-trip serves both — a sentinel header line, then the file. The path stays unquoted
-    (as the plain `cat` was) so `~` expands; hosts-file paths are whitespace-free by format.
-    `stat -f %m` is the BSD/mac fallback; an unparseable header just yields age None."""
-    cmd = (f'echo "{_AGE_HDR}$(date +%s) '
-           f'$(stat -c %Y {remote_status} 2>/dev/null || stat -f %m {remote_status} 2>/dev/null)"; '
-           f'cat {remote_status}')
+def build_fetch_cmd(remote_status):
+    """The one remote shell line: sentinel header (`#cc# <now> <mtime>`, both remote-clock),
+    then the file. The path stays unquoted (as a plain `cat` would be) so `~` expands;
+    hosts-file paths are whitespace-free by format. `stat -f %m` is the BSD/mac fallback."""
+    return (f'echo "{_AGE_HDR}$(date +%s) '
+            f'$(stat -c %Y {remote_status} 2>/dev/null || stat -f %m {remote_status} 2>/dev/null)"; '
+            f'cat {remote_status}')
+
+
+def parse_sentinel(stdout):
+    """Split a fetch's stdout into (payload, age_s, remote_mtime). The header line is
+    `#cc# <now> <mtime>` with both stamps from the remote's clock; a missing or unparseable
+    header fails open to (payload, None, None), and a negative age (remote clock jitter or a
+    write racing the stat) clamps to 0."""
+    if not stdout.startswith(_AGE_HDR):
+        return stdout, None, None
+    head, _, payload = stdout.partition("\n")
+    parts = head[len(_AGE_HDR):].split()
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        now_r, mtime = int(parts[0]), int(parts[1])
+        return payload, float(max(0, now_r - mtime)), mtime
+    return payload, None, None
+
+
+def classify_ssh_failure(rc, stderr, master_gone):
+    """Error class for a *finished* ssh exec: None (success) | 'auth' | 'unreachable' |
+    'no-file'. rc 255 means ssh itself failed before running the command: stderr patterns are
+    the primary evidence (BatchMode on a password host says "Permission denied"); on
+    ambiguity, `master_gone()` — a callable, because the probe costs a subprocess — breaks
+    the tie, since a dead master on a password host is the one failure that needs a human.
+    Any other non-zero rc means the remote shell ran but `cat` failed → 'no-file'."""
+    if rc == 0:
+        return None
+    if rc != 255:
+        return "no-file"
+    err = (stderr or "").lower()
+    if any(p in err for p in _AUTH_PATTERNS):
+        return "auth"
+    if any(p in err for p in _UNREACHABLE_PATTERNS):
+        return "unreachable"
+    return "auth" if master_gone() else "unreachable"
+
+
+def parse_snapshot(text):
+    """The mirrored Session[] list from a payload, or None for anything else (None input,
+    non-JSON, non-list) — the caller maps None to 'garbled'."""
+    if text is None:
+        return None
     try:
-        r = subprocess.run(["ssh", *SSH_OPTS, host, cmd],
-                           capture_output=True, text=True, timeout=SSH_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        return None, None, "unreachable"
-    if r.returncode == 255:                     # ssh itself failed — never reached the command
-        # stderr is the primary evidence (BatchMode on a password host says "Permission
-        # denied"); the master probe breaks the tie for anything ambiguous.
-        err = (r.stderr or "").lower()
-        if any(p in err for p in ("permission denied", "authentication",
-                                  "host key verification")):
-            return None, None, "auth"
-        if any(p in err for p in ("could not resolve", "timed out", "connection refused",
-                                  "no route", "network is unreachable")):
-            return None, None, "unreachable"
-        return None, None, ("auth" if _master_gone(host) else "unreachable")
-    if r.returncode != 0:                       # remote shell ran but `cat` failed
-        return None, None, "no-file"
-    out, age = r.stdout, None
-    if out.startswith(_AGE_HDR):
-        head, _, out = out.partition("\n")
-        parts = head[len(_AGE_HDR):].split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            age = float(max(0, int(parts[0]) - int(parts[1])))
-    return out, age, None
+        recs = json.loads(text)
+    except ValueError:
+        return None
+    return recs if isinstance(recs, list) else None
 
 
-def _health_file(host):
-    return _host_file(host).with_suffix(HEALTH_SUFFIX)
-
-
-def _write_health(host, ok, error, age, nsessions):
-    """Atomically write the host's `.health` sidecar (every tick, success or failure) and
-    return the dict. `consecutive_failures` carries over from the previous sidecar (read
-    fail-open) so consumers and the transition log can tell a blip from an outage."""
-    hf = _health_file(host)
-    prev_fail = 0
-    if not ok:
-        try:
-            prev_fail = int(json.loads(hf.read_text()).get("consecutive_failures", 0))
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
-    health = {"synced_at": time.time(), "ok": ok, "error": error,
-              "consecutive_failures": 0 if ok else prev_fail + 1,
-              "remote_status_age_s": age, "sessions": nsessions}
+def atomic_write_json(path, obj):
+    """tmp + os.replace under the target's own name (the `.tmp` twin never matches the
+    consumers' `*.json` globs). True on success, False fail-open — a full disk or bad
+    permissions must never crash the sync loop."""
     try:
-        REMOTE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = hf.with_suffix(hf.suffix + ".tmp")
-        tmp.write_text(json.dumps(health))
-        os.replace(tmp, hf)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(obj))
+        os.replace(tmp, path)
+        return True
     except OSError:
-        pass                                    # health is advisory — never fatal
-    return health
+        return False
 
 
-def sync_host(host, remote_status=REMOTE_STATUS):
+def read_prev_health(host):
+    """The host's previous sidecar dict, {} fail-open — feeds make_health's streak/ring."""
+    try:
+        prev = json.loads(_health_file(host).read_text())
+        return prev if isinstance(prev, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def make_health(prev, *, ok, error, age_s, remote_mtime, nsessions, now, interval_s):
+    """Build the sidecar-v2 dict for one tick. Pure — no I/O, no clock (`now` is an argument)
+    — so the hysteresis ladder is unit-testable:
+
+      success        → state "ok", streak reset, bad_since cleared.
+      failure        → streak = prev+1, bad_since sticks to the streak's first tick; then
+                       "down" once the streak hits DOWN_AFTER_FAILS ticks or DOWN_AFTER_BAD_S
+                       seconds (AUTH_DOWN_AFTER_FAILS for 'auth' — it can't self-heal),
+                       else "degraded".
+
+    The ring of distinct remote-clock mtimes lives in the sidecar itself (not daemon memory),
+    so it survives restarts and one-shots. `remote_write_cadence_s` (median delta between
+    ring entries) is the *observed refresh granularity* — the true remote write cadence when
+    fetches keep up, inflated toward the fetch interval when they don't. Either way it's the
+    right scale for the consumers' frozen-content threshold: an alarm can't meaningfully be
+    tighter than how often we actually observe the file advance."""
+    prev = prev if isinstance(prev, dict) else {}
+    if ok:
+        fails, bad_since, state = 0, None, "ok"
+    else:
+        try:
+            fails = int(prev.get("consecutive_failures") or 0) + 1
+        except (TypeError, ValueError):
+            fails = 1
+        prev_bad = prev.get("bad_since")
+        bad_since = prev_bad if isinstance(prev_bad, (int, float)) else now
+        down_fails = AUTH_DOWN_AFTER_FAILS if error == "auth" else DOWN_AFTER_FAILS
+        if fails >= down_fails or now - bad_since >= DOWN_AFTER_BAD_S:
+            state = "down"
+        else:
+            state = "degraded"
+    ring = prev.get("remote_mtimes")
+    ring = [m for m in ring if isinstance(m, (int, float))] if isinstance(ring, list) else []
+    if isinstance(remote_mtime, (int, float)) and (not ring or remote_mtime != ring[-1]):
+        ring = (ring + [remote_mtime])[-CADENCE_RING:]
+    deltas = [b - a for a, b in zip(ring, ring[1:]) if b > a]
+    cadence = float(statistics.median(deltas)) if deltas else None
+    return {"v": 2, "synced_at": now, "state": state, "ok": ok, "error": error,
+            "consecutive_failures": fails, "bad_since": bad_since,
+            "interval_s": interval_s, "ssh_timeout_s": SSH_TIMEOUT,
+            "remote_status_age_s": age_s, "remote_mtimes": ring,
+            "remote_write_cadence_s": cadence, "sessions": nsessions}
+
+
+def _fetch(host, remote_status=REMOTE_STATUS):
+    """One ssh round-trip → (payload, remote_age_s, remote_mtime, error). Thin sequence over
+    the primitives: build the command, run it, classify a failure, parse the sentinel. A
+    TimeoutExpired is its own class — a stalled exec on a healthy host must not read as the
+    host being unreachable (that misclassification was the flapping-⚠ bug)."""
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, host, build_fetch_cmd(remote_status)],
+                           capture_output=True, text=True, timeout=SSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, None, None, "timeout"
+    except (OSError, subprocess.SubprocessError):
+        return None, None, None, "unreachable"
+    err = classify_ssh_failure(r.returncode, r.stderr, lambda: _master_gone(host))
+    if err is not None:
+        return None, None, None, err
+    payload, age, mtime = parse_sentinel(r.stdout)
+    return payload, age, mtime, None
+
+
+def sync_host(host, remote_status=REMOTE_STATUS, interval_s=None, now=None):
     """Fetch one host, atomically write its mirror, and always write its `.health` sidecar.
     Returns the health dict. On failure the previous *mirror* is left in place (its mtime
     ages out on its own) — only the sidecar carries the bad news. The mirror is never gated
     on the remote file's age either: ccremote reports freshness, consumers decide what's too
     stale (mechanism here, policy there)."""
-    out, age, err = _fetch(host, remote_status)
-    recs = None
-    if err is None and out is not None:
-        try:
-            recs = json.loads(out)
-        except ValueError:
-            recs = None
-        if not isinstance(recs, list):
-            recs, err = None, "garbled"
-    if recs is None:
-        return _write_health(host, False, err or "garbled", age, None)
-    REMOTE_DIR.mkdir(parents=True, exist_ok=True)
-    dst = _host_file(host)
-    tmp = dst.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(recs))
-    os.replace(tmp, dst)
-    return _write_health(host, True, None, age, len(recs))
+    now = time.time() if now is None else now
+    payload, age, mtime, err = _fetch(host, remote_status)
+    recs = parse_snapshot(payload) if err is None else None
+    if err is None and recs is None:
+        err = "garbled"
+    if recs is not None and not atomic_write_json(_host_file(host), recs):
+        recs, err = None, "write-failed"       # local disk trouble — still a failed tick
+    health = make_health(read_prev_health(host), ok=recs is not None, error=err,
+                         age_s=age, remote_mtime=mtime,
+                         nsessions=len(recs) if recs is not None else None,
+                         now=now, interval_s=interval_s)
+    atomic_write_json(_health_file(host), health)   # advisory — never fatal
+    return health
 
 
-def sync_once(hosts):
-    """Sync every host once; return {host: health-dict}. `hosts` is load_hosts()'s
+def sync_once(hosts, interval_s=None):
+    """Sync every host once, in parallel (per-host ControlPath sockets — no contention), so
+    one slow host can't stretch the whole tick past the stale-mirror window for the others.
+    Returns {host: health-dict} in hosts-file order. `hosts` is load_hosts()'s
     [(host, remote_path), …]."""
-    return {host: sync_host(host, remote) for host, remote in hosts}
+    if not hosts:
+        return {}
+
+    def _one(host, remote):
+        try:
+            return sync_host(host, remote, interval_s=interval_s)
+        except Exception:                       # fail-open per host — never kill the tick
+            return make_health(read_prev_health(host), ok=False, error="garbled",
+                               age_s=None, remote_mtime=None, nsessions=None,
+                               now=time.time(), interval_s=interval_s)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as ex:
+        futures = {host: ex.submit(_one, host, remote) for host, remote in hosts}
+    return {host: fut.result() for host, fut in futures.items()}
 
 
 def remote_ack(host, sid, on=True):
@@ -246,6 +373,25 @@ def remote_ack(host, sid, on=True):
         return False
 
 
+def _health_key(health):
+    """What counts as 'the same situation' for transition logging: state + error class."""
+    return (health.get("state"), health.get("error"))
+
+
+def _transition_msg(host, prev_key, health):
+    """The --serve stderr line for this tick, or None when nothing changed. Keyed on
+    (state, error) so degraded→down and an error-class change both log while steady states
+    stay silent; the auth remedy text lives here (single source for the serve log)."""
+    if _health_key(health) == prev_key:
+        return None
+    if health.get("state") == "ok":
+        if prev_key is None:
+            return None                          # first healthy tick isn't news
+        return f"ccremote serve: {host}: recovered ({health.get('sessions')} session(s))"
+    hint = " — rerun ccremote-up.sh" if health.get("error") == "auth" else ""
+    return f"ccremote serve: {host}: {health.get('state')} ({health.get('error')}){hint}"
+
+
 def _restart_if_source_changed():
     """Re-exec in place if ccremote.py's own source changed since load (mirrors ccstatus.py)."""
     if _SELF_MTIME is None:
@@ -263,23 +409,16 @@ def _restart_if_source_changed():
 def _serve(interval):
     print(f"ccremote --serve: mirroring {REMOTES_FILE} → {REMOTE_DIR}/<host>.json every "
           f"{interval}s", file=sys.stderr)
-    prev = {}                           # host → (ok, error): log state *transitions*, not ticks
+    prev = {}                           # host → (state, error): log transitions, not ticks
     while True:
         _restart_if_source_changed()
         try:
             # hosts re-read each tick ⇒ edits take effect live
-            for host, health in sync_once(load_hosts()).items():
-                now, was = (health["ok"], health["error"]), prev.get(host)
-                if now == was:
-                    continue
-                prev[host] = now
-                if health["ok"]:
-                    if was is not None:              # first healthy tick isn't news
-                        print(f"ccremote serve: {host}: recovered "
-                              f"({health['sessions']} session(s))", file=sys.stderr)
-                else:
-                    hint = " — rerun ccremote-up.sh" if health["error"] == "auth" else ""
-                    print(f"ccremote serve: {host}: {health['error']}{hint}", file=sys.stderr)
+            for host, health in sync_once(load_hosts(), interval_s=interval).items():
+                msg = _transition_msg(host, prev.get(host), health)
+                prev[host] = _health_key(health)
+                if msg:
+                    print(msg, file=sys.stderr)
         except Exception as e:          # never let the daemon die on a transient error
             print(f"ccremote serve: {e}", file=sys.stderr)
         time.sleep(interval)
@@ -307,7 +446,8 @@ def main():
             print(f"{host}\t{health['sessions']} session(s){age_txt} → {_host_file(host)}")
         else:
             hint = " — rerun ccremote-up.sh" if health["error"] == "auth" else ""
-            print(f"{host}\tFAIL {health['error']}{hint} (x{health['consecutive_failures']})")
+            print(f"{host}\t{health['state'].upper()} {health['error']}{hint} "
+                  f"(x{health['consecutive_failures']})")
 
 
 if __name__ == "__main__":
