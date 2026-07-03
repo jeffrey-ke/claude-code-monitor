@@ -55,13 +55,16 @@ IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE", str(RUN / "ccmonitor-ignor
 # Remote monitoring: a sibling syncer (ccremote.py) SSH-mirrors each remote host's
 # run/status.json into run/remote/<host>.json; consumers fold those in via
 # load_remote_sessions(). The provider itself stays strictly machine-local.
-REMOTE_DIR = RUN / "remote"
-REMOTE_STALE_S = 15   # a mirror older than this ⇒ the syncer/host is down; drop its rows
-# The remote file's *own* age (from ccremote's sidecar, measured on the remote's clock)
-# beyond which its content is a frozen provider — the mirror mtime alone can't catch this,
-# because `ssh cat` of a dead-daemon's leftover file keeps refreshing the mirror ("phantom
-# fresh"). Deliberately > REMOTE_STALE_S so syncer-death fires first. Remote writes ~2s.
-REMOTE_CONTENT_STALE_S = 30
+# ($CCMONITOR_REMOTE_DIR mirrors ccremote's override — isolated worktree/test runs.)
+REMOTE_DIR = Path(os.environ.get("CCMONITOR_REMOTE_DIR", str(RUN / "remote")))
+# Freshness floors for read_verdict. Both scale UP from the sidecar's own self-description
+# (interval_s/ssh_timeout_s for the syncer, remote_write_cadence_s for the content), so a
+# slow-but-configured-that-way chain never reads as dead; the floors only catch a sidecar
+# too old/sparse to speak for itself.
+REMOTE_STALE_S = 15            # sidecar older than max(this, 3·interval+timeout) ⇒ syncer dead
+REMOTE_CONTENT_STALE_S = 30    # remote file older (remote clock) than max(this, 5·cadence) ⇒
+                               # the remote's provider froze while `ssh cat` kept re-mirroring
+                               # it fresh ("phantom fresh" — the mirror mtime can't see this)
 HEALTH_SUFFIX = ".health"      # ccremote's per-host sidecar (non-.json: the *.json mirror
                                # globs here and in ccbar can never mistake it for a mirror)
 REMOTES_FILE = Path(os.environ.get("CCMONITOR_REMOTES", str(RUN / "ccmonitor-remotes")))
@@ -525,12 +528,58 @@ def _read_health(hf):
     return rec if isinstance(rec, dict) else None
 
 
-def _content_stale(jf, stale_s=REMOTE_CONTENT_STALE_S):
-    """True if the mirror's sidecar says the remote file itself is frozen (remote provider
-    dead while `ssh cat` keeps succeeding) — the mirror mtime alone can't see this."""
-    health = _read_health(jf.with_suffix(HEALTH_SUFFIX))
-    age = (health or {}).get("remote_status_age_s")
-    return isinstance(age, (int, float)) and age > stale_s
+def _num(v):
+    """float(v) for a real number, else 0.0 — sidecar fields are foreign input."""
+    return float(v) if isinstance(v, (int, float)) else 0.0
+
+
+def read_verdict(health, sidecar_age_s):
+    """THE remote-trust rule, shared by every consumer (ccbar carries a stdlib mirror):
+    reduce one host's sidecar + its file age to a single verdict. ccremote already computed
+    the fetch-side judgment (`state`: ok | degraded | down, with hysteresis); what it cannot
+    know is whether its own sidecar is still being written or whether the remote file has
+    quietly frozen — the two read-side checks layered on top here:
+
+      missing        — no/garbled sidecar: the syncer never ran (mtime backstop elsewhere)
+      stale-mirror   — sidecar older than max(REMOTE_STALE_S, 3·interval_s + ssh_timeout_s):
+                       the syncer died (threshold scales to the syncer's own declared pace,
+                       so a slow tick or long ssh stall isn't read as death)
+      stale-content  — remote file's own age (remote clock) beyond
+                       max(REMOTE_CONTENT_STALE_S, 5·remote_write_cadence_s): the remote's
+                       provider froze (threshold scales to how often that host actually
+                       writes — a 12s-cadence Lustre host gets 60s, not 30)
+      ok | degraded | down — the sidecar's own verdict, passed through (a v1 sidecar
+                       without `state` maps ok→ok, else down)
+
+    Rows stay rendered for {ok, degraded}; red warnings fire for
+    {missing, stale-mirror, stale-content, down}. Pure — no I/O, no clock."""
+    if not isinstance(health, dict):
+        return "missing"
+    if sidecar_age_s is None or sidecar_age_s > max(
+            REMOTE_STALE_S, 3 * _num(health.get("interval_s")) + _num(health.get("ssh_timeout_s"))):
+        return "stale-mirror"
+    age = health.get("remote_status_age_s")
+    if isinstance(age, (int, float)) and age > max(
+            REMOTE_CONTENT_STALE_S, 5 * _num(health.get("remote_write_cadence_s"))):
+        return "stale-content"
+    state = health.get("state")
+    if state in ("ok", "degraded", "down"):
+        return state
+    return "ok" if health.get("ok") else "down"    # v1 sidecar: no hysteresis to pass through
+
+
+def _sidecar_verdict(jf, now):
+    """read_verdict for a mirror file's sidecar; None when there is no sidecar at all (then
+    the caller falls back to the mirror-mtime rule — e.g. a hand-copied mirror)."""
+    hf = jf.with_suffix(HEALTH_SUFFIX)
+    health = _read_health(hf)
+    if health is None and not hf.exists():
+        return None
+    try:
+        sidecar_age = now - hf.stat().st_mtime
+    except OSError:
+        sidecar_age = None
+    return read_verdict(health, sidecar_age)
 
 
 def load_remote_sessions(remote_dir=None, stale_s=REMOTE_STALE_S, now=None):
@@ -538,11 +587,13 @@ def load_remote_sessions(remote_dir=None, stale_s=REMOTE_STALE_S, now=None):
     verbatim Session[] snapshot a remote's `ccstatus --serve` wrote, SSH-copied here by
     ccremote.py) and return them as Session objects tagged with `host` = the file stem.
 
-    A mirror whose mtime is older than `stale_s` is skipped: the syncer or the remote host
-    is down, so those rows are unknowable and must not linger as phantom-live. Fail-open —
-    a missing dir, unreadable/garbled file, or bad record yields nothing for that source,
-    never an exception (same contract as get_sessions()). The provider never calls this;
-    consumers (ccdash) merge it with get_sessions()."""
+    Rows render only while the host's sidecar verdict is ok or degraded (a degraded blip
+    keeps rows — see read_verdict); missing/stale/down mirrors are unknowable and must not
+    linger as phantom-live. A mirror with no sidecar at all falls back to the mtime rule
+    (older than `stale_s` ⇒ dropped). Fail-open — a missing dir, unreadable/garbled file,
+    or bad record yields nothing for that source, never an exception (same contract as
+    get_sessions()). The provider never calls this; consumers (ccdash) merge it with
+    get_sessions()."""
     remote_dir = Path(remote_dir) if remote_dir is not None else REMOTE_DIR
     now = now if now is not None else time.time()
     out = []
@@ -552,10 +603,12 @@ def load_remote_sessions(remote_dir=None, stale_s=REMOTE_STALE_S, now=None):
         return out
     for jf in files:
         try:
-            if now - jf.stat().st_mtime > stale_s:
+            verdict = _sidecar_verdict(jf, now)
+            if verdict is None:                    # no sidecar — mirror mtime is all we have
+                if now - jf.stat().st_mtime > stale_s:
+                    continue
+            elif verdict not in ("ok", "degraded"):
                 continue
-            if _content_stale(jf):
-                continue        # phantom-fresh: syncer alive but the remote provider froze
             recs = json.loads(jf.read_text())
         except (OSError, ValueError):
             continue
@@ -597,51 +650,46 @@ def _remote_hosts():
 
 
 def load_remote_health(remote_dir=None, now=None):
-    """Per-host sync health for the consumers: {host: {"state", "age_s", "since"}} covering
-    exactly the hosts named in ccmonitor-remotes — the intent declaration: a listed host is
-    *expected* healthy, and commenting it out is the mute (its leftover sidecar is then
-    ignored, so it can't warn forever). Warn-forever while listed: no decay here. States:
+    """Per-host sync health for the consumers: {host: {"state", "error", "age_s", "since"}}
+    covering exactly the hosts named in ccmonitor-remotes — the intent declaration: a listed
+    host is *expected* healthy, and commenting it out is the mute (its leftover sidecar is
+    then ignored, so it can't warn forever). Warn-forever while listed: no decay here.
 
-      ok            — fresh mirror, fresh content
-      missing       — listed host with no sidecar at all ⇒ syncer never ran
-      stale-mirror  — sidecar mtime too old ⇒ the local syncer died
-      stale-content — syncer fine but the remote file's own age exceeds
-                      REMOTE_CONTENT_STALE_S ⇒ the remote's ccstatus --serve froze
-      auth | unreachable | no-file | garbled — ccremote's classified fetch failure
-                      ('auth' = control master gone; rerun ccremote-up.sh)
-
-    `age_s`: how long things have been bad — mirror age for stale-mirror, remote content age
-    for stale-content, time since the last successful sync (the mirror's mtime) for fetch
-    failures; None when unknowable. Fail-open per host, never raises."""
+    `state` is read_verdict's vocabulary — ok | degraded | down | missing | stale-mirror |
+    stale-content — with `error` carrying ccremote's fetch classification (auth | timeout |
+    unreachable | no-file | garbled | write-failed) alongside a degraded/down verdict
+    ('auth' = control master gone; rerun ccremote-up.sh). `age_s`: how long things have been
+    bad — the failure streak's age (bad_since) for degraded/down, the sidecar's age for
+    stale-mirror, the remote content age for stale-content; None when unknowable.
+    Fail-open per host, never raises."""
     remote_dir = Path(remote_dir) if remote_dir is not None else REMOTE_DIR
     now = now if now is not None else time.time()
     out = {}
     for host in _remote_hosts():
         hf = remote_dir / f"{host}{HEALTH_SUFFIX}"
-        if not hf.exists():
-            out[host] = {"state": "missing", "age_s": None, "since": None}
-            continue
         health = _read_health(hf)
         try:
             sidecar_age = now - hf.stat().st_mtime
         except OSError:
             sidecar_age = None
-        since = (health or {}).get("synced_at")
-        if health is None or sidecar_age is None or sidecar_age > REMOTE_STALE_S:
-            out[host] = {"state": "stale-mirror", "age_s": sidecar_age, "since": since}
-            continue
-        if not health.get("ok"):
-            try:                # the mirror's mtime is exactly the last successful sync
-                down_s = now - hf.with_suffix(".json").stat().st_mtime
-            except OSError:
-                down_s = None
-            state = str(health.get("error") or "garbled")
-            out[host] = {"state": state, "age_s": down_s, "since": since}
-            continue
-        age = health.get("remote_status_age_s")
-        age = float(age) if isinstance(age, (int, float)) else None
-        state = "stale-content" if (age is not None and age > REMOTE_CONTENT_STALE_S) else "ok"
-        out[host] = {"state": state, "age_s": age, "since": since}
+        verdict = read_verdict(health, sidecar_age)
+        h = health or {}
+        if verdict in ("degraded", "down"):
+            bad = h.get("bad_since")
+            if isinstance(bad, (int, float)):
+                age = now - bad
+            else:
+                try:            # v1 sidecar: the mirror's mtime is the last successful sync
+                    age = now - hf.with_suffix(".json").stat().st_mtime
+                except OSError:
+                    age = None
+        elif verdict == "stale-mirror":
+            age = sidecar_age
+        else:                                      # ok / stale-content / missing
+            age = h.get("remote_status_age_s")
+            age = float(age) if isinstance(age, (int, float)) else None
+        out[host] = {"state": verdict, "error": h.get("error"),
+                     "age_s": age, "since": h.get("synced_at")}
     return out
 
 

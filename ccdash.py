@@ -95,18 +95,35 @@ class _Section:
         self.style = style
 
 
-# Broken-sync status line per unhealthy host (states from ccstatus.load_remote_health). Rows
-# from that host silently vanish when its sync breaks, so this line stands in for them —
-# never silence.
+# Broken-sync status line per unhealthy host. Keys are read_verdict verdicts (stale-mirror/
+# stale-content/missing) and ccremote fetch-error classes (the rest — a down/degraded verdict
+# names its cause via rec["error"]). Rows from that host silently vanish when its sync breaks,
+# so this line stands in for them — never silence. Hysteresis split: a degraded blip renders
+# as a dim note (its rows are still in the table), bold red is reserved for a confirmed outage.
 _HEALTH_MSG = {
     "auth": "auth needed — rerun ccremote-up.sh",
+    "timeout": "ssh timing out",
     "unreachable": "unreachable",
     "no-file": "no status.json on host",
     "garbled": "garbled snapshot",
+    "write-failed": "local mirror write failing",
     "stale-content": "remote ccstatus --serve frozen",
     "stale-mirror": "syncer down — start ccremote",
     "missing": "syncer never ran — start ccremote",
 }
+
+
+def _health_line(host, rec):
+    """The _Section row for one host's sync health, or None while it's ok."""
+    state = rec.get("state")
+    if state == "ok":
+        return None
+    key = rec.get("error") if state in ("degraded", "down") else state
+    msg = _HEALTH_MSG.get(key, key or state)
+    age = f" ({fmt_age(int(rec['age_s']))})" if rec.get("age_s") else ""
+    if state == "degraded":
+        return _Section(f"⚠ {host} — sync degraded: {msg}{age}", style="grey58")
+    return _Section(f"⚠ {host} — {msg}{age}", style="bold red")
 
 # Drive mode: map a Textual key name → the tmux send-keys token. Printable characters
 # (letters, digits, punctuation) aren't here — they ride event.character and go via `-l`.
@@ -423,11 +440,9 @@ class CCDash(App):
         remote = self._ordered([s for s in sessions if s.host])
         # A configured host with broken sync gets a warning line where its rows would be —
         # rows silently vanishing must never read as "all quiet" (warn-forever; the
-        # ccmonitor-remotes file is the mute).
-        warns = [_Section(f"⚠ {h} — {_HEALTH_MSG.get(rec['state'], rec['state'])}"
-                          + (f" ({fmt_age(int(rec['age_s']))})" if rec.get("age_s") else ""),
-                          style="bold red")
-                 for h, rec in sorted((health or {}).items()) if rec["state"] != "ok"]
+        # ccmonitor-remotes file is the mute). Degraded = dim note under still-present rows.
+        warns = list(filter(None, (_health_line(h, rec)
+                                   for h, rec in sorted((health or {}).items()))))
         display = local + ([_Section("── remote ──")] + remote + warns
                            if remote or warns else [])
 

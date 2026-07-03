@@ -21,7 +21,8 @@ STATUS_JSON = Path.home() / ".claude" / "run" / "status.json"
 # Remote sessions mirrored from other machines by ccremote.py (one <host>.json per host, each
 # a verbatim Session[] snapshot). Read alongside the local snapshot; a mirror older than
 # STALE_AFTER_S is a dead syncer/host, so its rows are dropped (mirrors ccstatus loader).
-REMOTE_DIR = Path.home() / ".claude" / "run" / "remote"
+REMOTE_DIR = Path(os.environ.get("CCMONITOR_REMOTE_DIR",
+                                 str(Path.home() / ".claude" / "run" / "remote")))
 # Same ignore file ccdash/ccstatus use; mirrored here (ccbar stays stdlib-only, no provider
 # import) so an ignored session never alerts in the bar either. One regex/line, '#' comments.
 IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE",
@@ -57,21 +58,56 @@ def _esc(text):
     return text.replace("#", "##")
 
 
-def _content_stale(jf):
-    """True if the mirror's `.health` sidecar says the remote file itself is frozen (remote
-    provider dead while `ssh cat` keeps re-mirroring it fresh) — mirrors ccstatus."""
+def _num(v):
+    """float(v) for a real number, else 0.0 — sidecar fields are foreign input."""
+    return float(v) if isinstance(v, (int, float)) else 0.0
+
+
+def _read_verdict(health, sidecar_age):
+    """Reduce a host's sidecar + its file age to one verdict — the stdlib mirror of
+    ccstatus.read_verdict (kept diff-ably identical; no provider import). Rows render for
+    {ok, degraded}; the red ⚠ fires for {missing, stale-mirror, stale-content, down}.
+    Thresholds scale to the sidecar's own self-description (syncer pace, remote write
+    cadence) so a slow-but-alive chain never reads as dead."""
+    if not isinstance(health, dict):
+        return "missing"
+    if sidecar_age is None or sidecar_age > max(
+            STALE_AFTER_S, 3 * _num(health.get("interval_s")) + _num(health.get("ssh_timeout_s"))):
+        return "stale-mirror"
+    age = health.get("remote_status_age_s")
+    if isinstance(age, (int, float)) and age > max(
+            REMOTE_CONTENT_STALE_S, 5 * _num(health.get("remote_write_cadence_s"))):
+        return "stale-content"
+    state = health.get("state")
+    if state in ("ok", "degraded", "down"):
+        return state
+    return "ok" if health.get("ok") else "down"    # v1 sidecar: no hysteresis to pass through
+
+
+def _sidecar_verdict(jf, now):
+    """_read_verdict for a mirror's sidecar; None when there is no sidecar at all (the
+    caller then falls back to the mirror-mtime rule) — mirrors ccstatus._sidecar_verdict."""
+    hf = jf.with_suffix(HEALTH_SUFFIX)
     try:
-        health = json.loads(jf.with_suffix(HEALTH_SUFFIX).read_text())
-        age = health.get("remote_status_age_s")
-    except (OSError, ValueError, AttributeError):
-        return False                           # no/garbled sidecar ⇒ mtime rule alone decides
-    return isinstance(age, (int, float)) and age > REMOTE_CONTENT_STALE_S
+        health = json.loads(hf.read_text())
+        if not isinstance(health, dict):
+            health = None
+    except (OSError, ValueError):
+        health = None
+    if health is None and not hf.exists():
+        return None
+    try:
+        sidecar_age = now - hf.stat().st_mtime
+    except OSError:
+        sidecar_age = None
+    return _read_verdict(health, sidecar_age)
 
 
 def _load_remote():
-    """Fresh remote sessions from run/remote/*.json (fail-open to []). A mirror older than
-    STALE_AFTER_S (down syncer/host) or whose content the sidecar says is frozen is skipped
-    so a dead source can't alert forever — the ⚠<host> warning covers it instead."""
+    """Fresh remote sessions from run/remote/*.json (fail-open to []). Rows render only
+    while the host's sidecar verdict is ok or degraded (a degraded blip keeps rows); a
+    missing/stale/down source can't alert forever — the ⚠<host> warning covers it instead.
+    A mirror with no sidecar at all falls back to the mtime rule."""
     now = time.time()
     out = []
     try:
@@ -80,7 +116,11 @@ def _load_remote():
         return out
     for jf in files:
         try:
-            if now - jf.stat().st_mtime > STALE_AFTER_S or _content_stale(jf):
+            verdict = _sidecar_verdict(jf, now)
+            if verdict is None:                # no sidecar — mirror mtime is all we have
+                if now - jf.stat().st_mtime > STALE_AFTER_S:
+                    continue
+            elif verdict not in ("ok", "degraded"):
                 continue
             recs = json.loads(jf.read_text())
         except (OSError, ValueError):
@@ -110,11 +150,12 @@ def _load():
 
 
 def _unhealthy_hosts():
-    """Hosts listed in ccmonitor-remotes whose sync is broken (order preserved): sidecar
-    missing (syncer never ran), sidecar stale (syncer died), fetch failing (auth/unreachable/
-    no-file/garbled), or remote content frozen. Mirrors ccstatus.load_remote_health reduced
-    to a name list; commenting the host out of the file is the mute. Fail-open to []."""
-    now, bad = time.time(), []
+    """Hosts listed in ccmonitor-remotes whose verdict is red — {missing, stale-mirror,
+    stale-content, down}; a degraded blip is deliberately NOT here (hysteresis: red is
+    reserved for a confirmed outage). Order preserved; mirrors ccstatus.load_remote_health
+    reduced to a name list; commenting the host out of the file is the mute. Fail-open
+    to []."""
+    now, seen, bad = time.time(), set(), []
     try:
         lines = REMOTES_FILE.read_text().splitlines()
     except OSError:
@@ -125,19 +166,12 @@ def _unhealthy_hosts():
             continue
         host = line.split(None, 1)[0]
         stem = "".join(c if (c.isalnum() or c in "._@-") else "_" for c in host)
-        if stem in bad:
+        if stem in seen:
             continue
-        hf = REMOTE_DIR / f"{stem}{HEALTH_SUFFIX}"
-        try:
-            fresh = now - hf.stat().st_mtime <= STALE_AFTER_S
-            health = json.loads(hf.read_text())
-        except (OSError, ValueError):
-            bad.append(stem)                   # no/stale/garbled sidecar ⇒ syncer down
-            continue
-        age = health.get("remote_status_age_s") if isinstance(health, dict) else None
-        frozen = isinstance(age, (int, float)) and age > REMOTE_CONTENT_STALE_S
-        if not fresh or not isinstance(health, dict) or not health.get("ok") or frozen:
-            bad.append(stem)
+        seen.add(stem)
+        verdict = _sidecar_verdict(REMOTE_DIR / f"{stem}.json", now)
+        if verdict not in ("ok", "degraded"):  # None (no sidecar at all) is red: the host
+            bad.append(stem)                   # is *declared* here, so silence = missing
     return bad
 
 
