@@ -158,12 +158,44 @@ def _find_pane_pid(claude_pid, pane_pids):
     return None
 
 
+def _proc_identity_ok(comm, cmdline, proc_uid, my_uid):
+    """Does this /proc entry still look like the claude process a session record points at?
+    True iff it's ours (uid) and claude-ish — comm starts with `claude` or `node` (the CLI
+    runs on node, so comm may show the runtime), or `claude` appears anywhere in the
+    cmdline. Pure — the truth table is testable without a /proc."""
+    if proc_uid != my_uid:
+        return False
+    if (comm or "").lower().startswith(("claude", "node")):
+        return True
+    return "claude" in (cmdline or "").lower()
+
+
 def _alive(pid):
-    # Background sessions may have no live process; the agents list still vouches
-    # for them, so only a present-but-vanished pid counts as dead.
+    """A session's process is alive iff /proc/<pid> exists AND still passes the identity
+    check. Bare existence bred orange ghosts on multi-login-node hosts (bridges2): `claude
+    agents --json` reads $HOME-shared state while /proc is per-node, so a closed session's
+    pid — recycled by any unrelated process on a busy node — kept its last state (blocked/
+    busy) frozen forever. False-dead beats false-blocked: a genuinely cross-node session
+    shows `dead` (grey, non-alerting), never a phantom "needs you".
+
+    pid None stays vouched — a blocked background session has no live process by design;
+    the agents list is its witness. Fail-open nuance: an entry we can't even stat counts
+    alive (a permission hiccup must not kill a live session), but a different uid's pid is
+    dead — that IS the recycling case."""
     if pid is None:
         return True
-    return Path(f"/proc/{pid}").exists()
+    proc = Path(f"/proc/{pid}")
+    if not proc.exists():
+        return False
+    try:
+        proc_uid = proc.stat().st_uid
+    except OSError:
+        return True
+    try:
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        cmdline = ""
+    return _proc_identity_ok(_comm(pid), cmdline, proc_uid, os.getuid())
 
 
 # ── Source readers (all fail-open) ───────────────────────────────────────────
