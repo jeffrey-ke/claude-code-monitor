@@ -26,15 +26,19 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
 HOME = Path.home()
 RUN = HOME / ".claude" / "run"
 STATE_DIR = RUN / "state"
-STATUS_FILE = RUN / "status"
-STATUS_JSON = RUN / "status.json"   # full-fidelity Session[] snapshot for status-bar consumers
+# --serve output paths are env-overridable so a host with a small/quota'd $HOME can write the
+# snapshot elsewhere (e.g. scratch/project space). Both are tiny, atomically-overwritten
+# snapshots (not append logs) — see the header. Consumers on the *same* box read these defaults,
+# so only relocate on a host whose snapshot is fetched remotely (ccremote points at the new path).
+STATUS_FILE = Path(os.environ.get("CCSTATUS_STATUS_FILE", str(RUN / "status")))
+STATUS_JSON = Path(os.environ.get("CCSTATUS_STATUS_JSON", str(RUN / "status.json")))
 ACK_DIR = RUN / "ack"            # ~/.claude/run/ack/<sid>        (touch = responded-to)
 DISMISS_DIR = RUN / "dismissed"  # ~/.claude/run/dismissed/<sid>  (touch = hidden in ccdash)
 ROSTER = HOME / ".claude" / "daemon" / "roster.json"
@@ -48,6 +52,19 @@ _SELF_MTIME = _SELF_PATH.stat().st_mtime if _SELF_PATH.exists() else None
 # The PROVIDER never filters on it — get_sessions() always emits the full Session[] so the
 # notch / --serve stay complete; only the display consumers drop ignored rows.
 IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE", str(RUN / "ccmonitor-ignore")))
+# Remote monitoring: a sibling syncer (ccremote.py) SSH-mirrors each remote host's
+# run/status.json into run/remote/<host>.json; consumers fold those in via
+# load_remote_sessions(). The provider itself stays strictly machine-local.
+REMOTE_DIR = RUN / "remote"
+REMOTE_STALE_S = 15   # a mirror older than this ⇒ the syncer/host is down; drop its rows
+# The remote file's *own* age (from ccremote's sidecar, measured on the remote's clock)
+# beyond which its content is a frozen provider — the mirror mtime alone can't catch this,
+# because `ssh cat` of a dead-daemon's leftover file keeps refreshing the mirror ("phantom
+# fresh"). Deliberately > REMOTE_STALE_S so syncer-death fires first. Remote writes ~2s.
+REMOTE_CONTENT_STALE_S = 30
+HEALTH_SUFFIX = ".health"      # ccremote's per-host sidecar (non-.json: the *.json mirror
+                               # globs here and in ccbar can never mistake it for a mirror)
+REMOTES_FILE = Path(os.environ.get("CCMONITOR_REMOTES", str(RUN / "ccmonitor-remotes")))
 
 # Sort/priority: actionable states float to the top (k9s convention).
 STATE_ORDER = {"blocked": 0, "busy": 1, "shell": 2, "idle": 3, "dead": 4}
@@ -81,6 +98,8 @@ class Session:
     engaged: bool = False       # transcript has ≥1 assistant turn (Claude has actually
                                 # responded); gates the consumer "your turn" tier so a fresh
                                 # idle session (never answered) isn't mistaken for a hand-back
+    host: str = ""              # "" = local; set to the SSH host by load_remote_sessions()
+                                # for a session mirrored from another machine (view-only)
 
 
 # ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -483,6 +502,147 @@ def is_ignored(s, patterns):
     repo name hides a whole tree)."""
     return any(p.search(field) for p in patterns
                for field in (s.kind, s.title, s.cwd_short))
+
+
+# ── Remote sessions (consumer-side; mirrored by ccremote.py, not gathered here) ─
+
+_SESSION_FIELDS = {f.name for f in fields(Session)}
+# Tolerant reconstruction for mirrored records: a remote running an older/newer schema may
+# lack fields that have no dataclass default — fill them by type instead of dropping the row
+# (ccbar's dict reads already tolerate this; ccdash shouldn't be stricter). Only a record
+# with no session_id is skipped: identity is the one thing ack/dedup can't fake.
+_SESSION_DEFAULTS = {"session_id": "", "short_id": "", "pid": None, "kind": "interactive",
+                     "state": "idle", "title": "", "synopsis": "", "cwd": "", "cwd_short": "",
+                     "tmux_target": None, "pane_id": None, "age_s": None}
+
+
+def _read_health(hf):
+    """One ccremote `.health` sidecar, parsed fail-open; None if missing/garbled."""
+    try:
+        rec = json.loads(hf.read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _content_stale(jf, stale_s=REMOTE_CONTENT_STALE_S):
+    """True if the mirror's sidecar says the remote file itself is frozen (remote provider
+    dead while `ssh cat` keeps succeeding) — the mirror mtime alone can't see this."""
+    health = _read_health(jf.with_suffix(HEALTH_SUFFIX))
+    age = (health or {}).get("remote_status_age_s")
+    return isinstance(age, (int, float)) and age > stale_s
+
+
+def load_remote_sessions(remote_dir=None, stale_s=REMOTE_STALE_S, now=None):
+    """Sessions mirrored from other machines: read every run/remote/<host>.json (each is a
+    verbatim Session[] snapshot a remote's `ccstatus --serve` wrote, SSH-copied here by
+    ccremote.py) and return them as Session objects tagged with `host` = the file stem.
+
+    A mirror whose mtime is older than `stale_s` is skipped: the syncer or the remote host
+    is down, so those rows are unknowable and must not linger as phantom-live. Fail-open —
+    a missing dir, unreadable/garbled file, or bad record yields nothing for that source,
+    never an exception (same contract as get_sessions()). The provider never calls this;
+    consumers (ccdash) merge it with get_sessions()."""
+    remote_dir = Path(remote_dir) if remote_dir is not None else REMOTE_DIR
+    now = now if now is not None else time.time()
+    out = []
+    try:
+        files = sorted(remote_dir.glob("*.json"))
+    except OSError:
+        return out
+    for jf in files:
+        try:
+            if now - jf.stat().st_mtime > stale_s:
+                continue
+            if _content_stale(jf):
+                continue        # phantom-fresh: syncer alive but the remote provider froze
+            recs = json.loads(jf.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(recs, list):
+            continue
+        host = jf.stem
+        for rec in recs:
+            if not isinstance(rec, dict) or not rec.get("session_id"):
+                continue
+            try:
+                s = Session(**{**_SESSION_DEFAULTS,
+                               **{k: v for k, v in rec.items() if k in _SESSION_FIELDS}})
+            except TypeError:
+                continue        # still-unbuildable record ⇒ skip it, keep the rest
+            s.host = host
+            out.append(s)
+    return out
+
+
+def _remote_hosts():
+    """Host names from ccmonitor-remotes (first field per line, '#' comments), sanitized to
+    the mirror-file stems ccremote uses. Mirrors ccremote.load_hosts/_host_file — a deliberate
+    ~10-line duplication (same idiom as ccbar's stdlib copies) so this consumer library never
+    imports the network-touching syncer."""
+    stems = []
+    try:
+        lines = REMOTES_FILE.read_text().splitlines()
+    except OSError:
+        return stems
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        host = line.split(None, 1)[0]
+        stem = "".join(c if (c.isalnum() or c in "._@-") else "_" for c in host)
+        if stem not in stems:
+            stems.append(stem)
+    return stems
+
+
+def load_remote_health(remote_dir=None, now=None):
+    """Per-host sync health for the consumers: {host: {"state", "age_s", "since"}} covering
+    exactly the hosts named in ccmonitor-remotes — the intent declaration: a listed host is
+    *expected* healthy, and commenting it out is the mute (its leftover sidecar is then
+    ignored, so it can't warn forever). Warn-forever while listed: no decay here. States:
+
+      ok            — fresh mirror, fresh content
+      missing       — listed host with no sidecar at all ⇒ syncer never ran
+      stale-mirror  — sidecar mtime too old ⇒ the local syncer died
+      stale-content — syncer fine but the remote file's own age exceeds
+                      REMOTE_CONTENT_STALE_S ⇒ the remote's ccstatus --serve froze
+      auth | unreachable | no-file | garbled — ccremote's classified fetch failure
+                      ('auth' = control master gone; rerun ccremote-up.sh)
+
+    `age_s`: how long things have been bad — mirror age for stale-mirror, remote content age
+    for stale-content, time since the last successful sync (the mirror's mtime) for fetch
+    failures; None when unknowable. Fail-open per host, never raises."""
+    remote_dir = Path(remote_dir) if remote_dir is not None else REMOTE_DIR
+    now = now if now is not None else time.time()
+    out = {}
+    for host in _remote_hosts():
+        hf = remote_dir / f"{host}{HEALTH_SUFFIX}"
+        if not hf.exists():
+            out[host] = {"state": "missing", "age_s": None, "since": None}
+            continue
+        health = _read_health(hf)
+        try:
+            sidecar_age = now - hf.stat().st_mtime
+        except OSError:
+            sidecar_age = None
+        since = (health or {}).get("synced_at")
+        if health is None or sidecar_age is None or sidecar_age > REMOTE_STALE_S:
+            out[host] = {"state": "stale-mirror", "age_s": sidecar_age, "since": since}
+            continue
+        if not health.get("ok"):
+            try:                # the mirror's mtime is exactly the last successful sync
+                down_s = now - hf.with_suffix(".json").stat().st_mtime
+            except OSError:
+                down_s = None
+            state = str(health.get("error") or "garbled")
+            out[host] = {"state": state, "age_s": down_s, "since": since}
+            continue
+        age = health.get("remote_status_age_s")
+        age = float(age) if isinstance(age, (int, float)) else None
+        state = "stale-content" if (age is not None and age > REMOTE_CONTENT_STALE_S) else "ok"
+        out[host] = {"state": state, "age_s": age, "since": since}
+    return out
 
 
 # ── Assembly ─────────────────────────────────────────────────────────────────

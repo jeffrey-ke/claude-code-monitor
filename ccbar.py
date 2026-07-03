@@ -18,11 +18,24 @@ import time
 from pathlib import Path
 
 STATUS_JSON = Path.home() / ".claude" / "run" / "status.json"
+# Remote sessions mirrored from other machines by ccremote.py (one <host>.json per host, each
+# a verbatim Session[] snapshot). Read alongside the local snapshot; a mirror older than
+# STALE_AFTER_S is a dead syncer/host, so its rows are dropped (mirrors ccstatus loader).
+REMOTE_DIR = Path.home() / ".claude" / "run" / "remote"
 # Same ignore file ccdash/ccstatus use; mirrored here (ccbar stays stdlib-only, no provider
 # import) so an ignored session never alerts in the bar either. One regex/line, '#' comments.
 IGNORE_FILE = Path(os.environ.get("CCMONITOR_IGNORE",
                                   str(Path.home() / ".claude" / "run" / "ccmonitor-ignore")))
+# The remote-hosts intent declaration ccremote syncs from; a listed host with broken sync
+# gets a red ⚠<host> warning (comment it out to mute). Mirrored stdlib-only from ccstatus.
+REMOTES_FILE = Path(os.environ.get("CCMONITOR_REMOTES",
+                                   str(Path.home() / ".claude" / "run" / "ccmonitor-remotes")))
 STALE_AFTER_S = 15          # serve writes every ~2s; older than this ⇒ daemon is likely dead
+# ccremote's per-host sidecar (non-.json so the mirror glob below never sees it) + the remote
+# file's own age (remote clock) beyond which its provider is frozen — mirrors ccstatus.
+HEALTH_SUFFIX = ".health"
+REMOTE_CONTENT_STALE_S = 30
+WARN_MAX_HOSTS = 2          # host names shown in the ⚠ segment before collapsing to +N
 TITLE_MAX = 28
 MAX_OUT = 200               # hard cap on emitted length — a guard against an absurd snapshot,
                             # never hit by 2 short segments; protects tmux's format parser
@@ -33,7 +46,9 @@ ALERT = "#[fg=yellow,bold]"
 # magenta is the closest named color to ccdash's AWAIT_STYLE="purple" / AWAIT_GLYPH="◆".
 TURN = "#[fg=magenta]"
 TURN_GLYPH = "◆"
+WARN = "#[fg=red]"          # broken remote sync — louder than the dim local-stale ⚠
 DIM = "#[fg=colour244]"
+SECTION_SEP = "#[fg=colour240]│#[default]"   # divides the local section from the remote section
 RESET = "#[default]"
 
 
@@ -42,14 +57,88 @@ def _esc(text):
     return text.replace("#", "##")
 
 
+def _content_stale(jf):
+    """True if the mirror's `.health` sidecar says the remote file itself is frozen (remote
+    provider dead while `ssh cat` keeps re-mirroring it fresh) — mirrors ccstatus."""
+    try:
+        health = json.loads(jf.with_suffix(HEALTH_SUFFIX).read_text())
+        age = health.get("remote_status_age_s")
+    except (OSError, ValueError, AttributeError):
+        return False                           # no/garbled sidecar ⇒ mtime rule alone decides
+    return isinstance(age, (int, float)) and age > REMOTE_CONTENT_STALE_S
+
+
+def _load_remote():
+    """Fresh remote sessions from run/remote/*.json (fail-open to []). A mirror older than
+    STALE_AFTER_S (down syncer/host) or whose content the sidecar says is frozen is skipped
+    so a dead source can't alert forever — the ⚠<host> warning covers it instead."""
+    now = time.time()
+    out = []
+    try:
+        files = sorted(REMOTE_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for jf in files:
+        try:
+            if now - jf.stat().st_mtime > STALE_AFTER_S or _content_stale(jf):
+                continue
+            recs = json.loads(jf.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(recs, list):
+            for r in recs:                     # tag the source host (the remote wrote host="")
+                if isinstance(r, dict):        # so the segment can label it `host:<title>`
+                    r["host"] = jf.stem
+            out.extend(recs)
+    return out
+
+
 def _load():
-    """Return (sessions, stale). Fail-open: any error ⇒ ([], False) so the bar stays quiet."""
+    """Return (sessions, stale). `sessions` = local snapshot + fresh remote mirrors; `stale`
+    tracks the *local* daemon only. Local and remote are read independently — a missing or
+    corrupt local snapshot flags stale (a dead daemon must not look like all-quiet) and must
+    never suppress the remote sections, which have their own sync chain."""
+    local, stale = [], False
     try:
         age = time.time() - STATUS_JSON.stat().st_mtime
-        sessions = json.loads(STATUS_JSON.read_text())
-        return (sessions if isinstance(sessions, list) else []), age > STALE_AFTER_S
+        rows = json.loads(STATUS_JSON.read_text())
+        local = rows if isinstance(rows, list) else []
+        stale = age > STALE_AFTER_S
     except (OSError, ValueError):
-        return [], False
+        stale = True
+    return local + _load_remote(), stale
+
+
+def _unhealthy_hosts():
+    """Hosts listed in ccmonitor-remotes whose sync is broken (order preserved): sidecar
+    missing (syncer never ran), sidecar stale (syncer died), fetch failing (auth/unreachable/
+    no-file/garbled), or remote content frozen. Mirrors ccstatus.load_remote_health reduced
+    to a name list; commenting the host out of the file is the mute. Fail-open to []."""
+    now, bad = time.time(), []
+    try:
+        lines = REMOTES_FILE.read_text().splitlines()
+    except OSError:
+        return bad
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        host = line.split(None, 1)[0]
+        stem = "".join(c if (c.isalnum() or c in "._@-") else "_" for c in host)
+        if stem in bad:
+            continue
+        hf = REMOTE_DIR / f"{stem}{HEALTH_SUFFIX}"
+        try:
+            fresh = now - hf.stat().st_mtime <= STALE_AFTER_S
+            health = json.loads(hf.read_text())
+        except (OSError, ValueError):
+            bad.append(stem)                   # no/stale/garbled sidecar ⇒ syncer down
+            continue
+        age = health.get("remote_status_age_s") if isinstance(health, dict) else None
+        frozen = isinstance(age, (int, float)) and age > REMOTE_CONTENT_STALE_S
+        if not fresh or not isinstance(health, dict) or not health.get("ok") or frozen:
+            bad.append(stem)
+    return bad
 
 
 def _awaiting(s):
@@ -90,17 +179,28 @@ def _segment(rows, glyph, style):
     if not rows:
         return ""
     rows = sorted(rows, key=lambda s: s["age_s"] if s.get("age_s") is not None else 1 << 30)
-    title = _esc(str(rows[0].get("title") or "?")[:TITLE_MAX])   # str() — a corrupt snapshot
-    out = f"{style}{glyph} {title}{RESET}"                       # may hand us a non-string
+    name = str(rows[0].get("title") or "?")                      # str() — a corrupt snapshot
+    if rows[0].get("host"):                                      # may hand us a non-string
+        name = f"{rows[0]['host']}:{name}"                       # remote: label `host:<title>`
+    title = _esc(name[:TITLE_MAX])
+    out = f"{style}{glyph} {title}{RESET}"
     if len(rows) > 1:
         out += f"{DIM} +{len(rows) - 1} more{RESET}"
     return out
 
 
-def render(sessions, stale):
-    if stale:
-        # A dead daemon must not masquerade as "all clear"; flag it faintly instead.
-        return f"{DIM}⚠{RESET}"
+def _two_tier(rows):
+    """The blocked (⛔) + your-turn (◆) segments for one section (local or a remote host), joined
+    by 3 spaces; '' if the section has nothing needing you. Drops acked/dismissed as before."""
+    blocked = [s for s in rows
+               if s.get("state") == "blocked"
+               and not s.get("acknowledged") and not s.get("dismissed")]
+    awaiting = [s for s in rows if _awaiting(s)]
+    segs = [_segment(blocked, "⛔", ALERT), _segment(awaiting, TURN_GLYPH, TURN)]
+    return "   ".join(seg for seg in segs if seg)   # 3 spaces between blocked (loud) + turn (soft)
+
+
+def render(sessions, stale, unhealthy=()):
     # Two tiers, mirroring ccdash: blocked = "needs you" hard stop; awaiting = "your turn".
     # Both drop the ones already responded-to or hidden (auto-clear on new provider activity).
     # Skip non-dict rows defensively — a corrupt snapshot must never crash the bar.
@@ -108,12 +208,27 @@ def render(sessions, stale):
     patterns = _load_ignore()                       # honor the same ignore file as ccdash
     if patterns:
         rows = [s for s in rows if not _ignored(s, patterns)]
-    blocked = [s for s in rows
-               if s.get("state") == "blocked"
-               and not s.get("acknowledged") and not s.get("dismissed")]
-    awaiting = [s for s in rows if _awaiting(s)]
-    segs = [_segment(blocked, "⛔", ALERT), _segment(awaiting, TURN_GLYPH, TURN)]
-    out = "   ".join(seg for seg in segs if seg)   # 3 spaces between blocked (loud) + turn (soft)
+    # Local and remote (mirrored from another host) sessions get their own section, so at a glance
+    # you can tell where an alert lives. Each section shows the same two tiers.
+    local = [s for s in rows if not s.get("host")]
+    remote = [s for s in rows if s.get("host")]
+    if stale:
+        # A dead local daemon must not masquerade as "all clear" — flag it faintly — but its
+        # rows are untrusted, and the remote sections (own sync chain) still render.
+        local = []
+    sections = [_two_tier(local), _two_tier(remote)]
+    body = f"   {SECTION_SEP}   ".join(sec for sec in sections if sec)  # divider between two
+    parts = []                                                          # non-empty sections
+    if stale:
+        parts.append(f"{DIM}⚠{RESET}")
+    if body:
+        parts.append(body)
+    if unhealthy:
+        # Broken remote sync is loud (red), never silent-vanishing rows: ⚠psc,gpu2 +1
+        names = ",".join(_esc(str(h))[:TITLE_MAX] for h in unhealthy[:WARN_MAX_HOSTS])
+        more = f" +{len(unhealthy) - WARN_MAX_HOSTS}" if len(unhealthy) > WARN_MAX_HOSTS else ""
+        parts.append(f"{WARN}⚠{names}{more}{RESET}")
+    out = "   ".join(parts)
     if len(out) > MAX_OUT:
         # Clamp an absurd snapshot; re-append RESET so a cut never leaves a dangling #[...].
         out = out[:MAX_OUT] + RESET
@@ -123,7 +238,7 @@ def render(sessions, stale):
 def main():
     try:
         sessions, stale = _load()
-        sys.stdout.write(render(sessions, stale))
+        sys.stdout.write(render(sessions, stale, _unhealthy_hosts()))
     except Exception:
         sys.stdout.write("")   # never let a bug brick tmux's status-right
 

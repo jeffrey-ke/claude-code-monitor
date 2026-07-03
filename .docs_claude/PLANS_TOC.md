@@ -22,6 +22,10 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-07-01** — [remote-sync-health.md](plans/completed/remote-sync-health.md) `completed`
+- **2026-07-01** — [ccdash-remote-session-monitor.md](plans/completed/ccdash-remote-session-monitor.md) `completed`
+- **2026-06-30** — [synopsis-no-anchor-on-low-confidence.md](plans/active/synopsis-no-anchor-on-low-confidence.md) `active` `bugfix`
+- **2026-06-30** — [ccdash-peek-scroll-fix.md](plans/completed/ccdash-peek-scroll-fix.md) `completed` `bugfix`
 - **2026-06-30** — [self-heal-serve-daemon.md](plans/completed/self-heal-serve-daemon.md) `completed` `bugfix`
 - **2026-06-30** — [fix-phantom-mtime-reflag.md](plans/completed/fix-phantom-mtime-reflag.md) `completed` `bugfix`
 - **2026-06-30** — [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md) `completed`
@@ -47,6 +51,72 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [remote-sync-health.md](plans/completed/remote-sync-health.md)
+`plans/completed/` · 2026-07-01 · `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `ccremote-up.sh`
+> Makes remote-sync failure *loud* in both consumers after a psc question silently never
+> alerted: skew-free content-freshness measurement in the ssh fetch, per-host `.health`
+> sidecars with a classified error taxonomy, a red warn-forever `⚠<host>` ccbar segment and
+> bold-red `⚠ <host> — <why>` ccdash rows for every unhealthy `ccmonitor-remotes` host, plus
+> two ccbar coupling fixes so a dead local daemon can't hide remote alerts. Abstracted under
+> topic 4 (remote control); listed here for the ccstatus/ccdash/ccbar facet.
+>
+> **Key changes:**
+> - `~ ccremote.py` — sentinel-header fetch + `.health` sidecar + error classification
+> - `~ ccstatus.py` — content-stale drop, tolerant rebuild, `+ load_remote_health()`
+> - `~ ccbar.py` — decoupled loads, red `⚠<host>` segment; `~ ccdash.py` — red health rows
+> - `~ ccremote-up.sh` / `~ CLAUDE.md` — auth-recovery + design docs
+
+### [ccdash-remote-session-monitor.md](plans/completed/ccdash-remote-session-monitor.md)
+`plans/completed/` · 2026-07-01 · `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py`
+> Extends the ccstatus/ccdash/ccbar stack to also surface sessions running on *other* machines.
+> Adds `Session.host` and a consumer-side `load_remote_sessions()` to the provider (which itself
+> stays strictly local), plus a new `ccremote.py` daemon that SSH-mirrors each configured host's
+> `run/status.json` to `run/remote/<host>.json`. `ccdash` merges the mirrors (view-only `@host`
+> rows, local-tmux actions gated), `ccbar` reads them alongside the local snapshot. Same
+> provider-local / consumer-merge discipline as the ignore list; a stale mirror drops so a
+> downed host never lingers. Abstracted under topic 4 (remote control); listed here for the
+> ccstatus/ccdash/ccbar facet.
+>
+> **Key changes:**
+> - `+ ccremote.py`; `~ ccstatus.py` (`Session.host`, `load_remote_sessions()`)
+> - `~ ccdash.py` (merge + `@host` tag + gate local-tmux actions); `~ ccbar.py` (`_load_remote()`)
+> - `~ CLAUDE.md` — module index + design-decision bullet
+
+### [synopsis-no-anchor-on-low-confidence.md](plans/active/synopsis-no-anchor-on-low-confidence.md)
+`plans/active/` · 2026-06-30
+> Fixes a ccdash row showing a stuck placeholder-sounding title/synopsis
+> (`(awaiting plan details)` / `(unable to determine — no prior context or plan files found)`)
+> for a session that, by inspection time, had a full real transcript. Neither string is
+> hardcoded — they're literal Haiku output from `ccsynopsis.py`, written when the early
+> "recent activity" window was sparse/boilerplate. Because the EMA prompt is deliberately
+> sticky ("keep the TITLE identical... prefer no change"), this junk first-impression never
+> self-corrected. Compounded by [[title-prefer-haiku-synopsis]], which made titles always
+> prefer the Haiku synopsis, so the junk surfaces directly instead of being masked. Fix: an
+> explicit `UNKNOWN` sentinel Haiku emits on a no-signal cold start, normalized to `None` in
+> `_parse()` so the existing empty-title guard skips the write — the EMA only ever anchors on
+> genuine signal. See topic 2 for the synopsis-mechanism facet.
+>
+> **Key changes:**
+> - `~ ccsynopsis.py` — `SYS`/`PROMPT_TEMPLATE` instruct Haiku to answer `UNKNOWN` for both
+>   fields on a no-signal cold start instead of guessing a vague placeholder
+> - `~ ccsynopsis.py` `_parse()` — normalize a sentinel hit to `None` per field
+> - `+ CLAUDE.md` — "Low-confidence first impressions are never anchored" design-decision bullet
+
+### [ccdash-peek-scroll-fix.md](plans/completed/ccdash-peek-scroll-fix.md)
+`plans/completed/` · 2026-06-30
+> Fixes the inline preview panel (`P`) clipping its own most useful content: a fixed-height
+> non-scrolling `Static` drew the understanding header + a live 12-line pane tail, and
+> whenever the (variable-height) header pushed the total past the box's 16 rows, the bottom
+> of the render — the newest, most relevant pane-tail lines — got cut off instead of the
+> header. Mirrors `DriveScreen`'s existing live-tail pattern: wraps the panel in a
+> non-focusable `VerticalScroll` and scrolls to the end on every update, so the live tail is
+> always what's visible and any clipping falls on older header content instead.
+>
+> **Key changes:**
+> - `~ ccdash.py` — `compose()`: `self.peek` is now a `VerticalScroll(self.peek_body, ...)`, `can_focus = False`
+> - `+ ccdash.py` — `_set_peek()` helper (update body + `scroll_end(animate=False)`)
+> - `~ ccdash.py` — `_update_peek()` / `_peek_capture()` route through `_set_peek`
 
 ### [self-heal-serve-daemon.md](plans/completed/self-heal-serve-daemon.md)
 `plans/completed/` · 2026-06-30
@@ -213,6 +283,25 @@ their tmux wiring.
 The Stop-hook Haiku summarizer that evolves a sticky per-session name and a richer hidden
 "understanding" as a moving average.
 
+### [synopsis-no-anchor-on-low-confidence.md](plans/active/synopsis-no-anchor-on-low-confidence.md)
+`plans/active/` · 2026-06-30
+> The EMA's "keep the title identical unless the focus has genuinely shifted" stickiness
+> (intended to stop flicker) had no way to recognize a *bad* first impression: when the
+> earliest "recent activity" window is sparse/boilerplate, Haiku can honestly write a vague,
+> placeholder-sounding title/understanding, which then gets fed back as the prior title
+> forever, never self-correcting even once the session has real content. Fix is prompt-only:
+> Haiku answers the literal sentinel `UNKNOWN` for both fields when there's no prior title and
+> no concrete signal yet, instead of guessing; `_parse()` normalizes that to `None` so the
+> existing `if not title: return` guard in `_worker()` already skips the write unchanged. See
+> topic 1 for the dashboard-visible symptom.
+>
+> **Key changes:**
+> - `~ ccsynopsis.py` — `SENTINEL = "UNKNOWN"`; `SYS`/`PROMPT_TEMPLATE` instruct the cold-start
+>   escape hatch (scoped to "no prior title yet")
+> - `~ ccsynopsis.py` `_parse()` — case/punctuation-tolerant exact-token sentinel → `None`
+>   normalization, independently per field
+> - `+ CLAUDE.md` — new design-decision bullet after "Synopsis is a moving average"
+
 ### [title-prefer-haiku-synopsis.md](plans/completed/title-prefer-haiku-synopsis.md)
 `plans/completed/` · 2026-06-30
 > Promotes the Haiku `.synopsis` to be the primary source of a session's display title. The
@@ -277,7 +366,70 @@ The file-based outbox contract and the single tmux `send-keys` delivery seam tha
 ## 4. SSH bridge & remote control
 
 The reverse-SSH-tunnel transport that lets the Mac notch app monitor and control remote Linux
-Claude Code sessions, and the message/permission content that rides it.
+Claude Code sessions, and the message/permission content that rides it — plus the *opposite
+axis*, one Linux box's Python consumers mirroring another host's sessions over SSH.
+
+### [remote-sync-health.md](plans/completed/remote-sync-health.md)
+`plans/completed/` · 2026-07-01 · touches `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `ccremote-up.sh`
+> Hardens the [[ccdash-remote-session-monitor]] sync path after a real miss: a psc session's
+> AskUserQuestion never alerted locally because the sync chain wasn't running — and the design
+> silently dropped stale mirrors, so "sync broken" rendered exactly like "all quiet". Adds
+> end-to-end **content** freshness (the ssh fetch prepends a `#cc# <now> <mtime>` sentinel, both
+> stamps on the *remote's* clock, closing the "phantom-fresh" hole where a dead remote provider's
+> frozen file keeps the mirror mtime fresh) and per-host `.health` sidecars with a classified
+> error taxonomy (`auth` — dead password-auth ControlMaster, rerun ccremote-up.sh /
+> `unreachable` / `no-file` / `garbled`). Both consumers surface broken sync loudly and
+> warn-forever: a red `⚠<host>` ccbar segment and a bold-red `⚠ <host> — <why>` ccdash row for
+> any host in `ccmonitor-remotes` that isn't healthy (commenting a host out is the mute). Also
+> fixes two ccbar coupling bugs (a missing local snapshot no longer hides remote rows; the
+> local-stale `⚠` no longer swallows remote sections), makes remote-record reconstruction
+> tolerant of schema skew, and aligns ccremote's ControlPersist with ccremote-up.sh (12h).
+> Considered and rejected: a message broker/queue — the snapshot is level-triggered state and
+> SSH already-reliable transport; the missing pieces were freshness metadata and loudness.
+>
+> **Key changes:**
+> - `~ ccremote.py` — `_fetch` sentinel header (skew-free `remote_status_age_s`), `.health`
+>   sidecar per tick (`{synced_at, ok, error, consecutive_failures, remote_status_age_s,
+>   sessions}`), rc/stderr error classification + `_master_gone` (`ssh -O check`) tie-break,
+>   `sync_host`/`sync_once` return health dicts, `_serve` logs health *transitions*,
+>   ControlPersist from `$CCREMOTE_CONTROL_PERSIST` (default 12h)
+> - `~ ccstatus.py` — `load_remote_sessions` drops content-stale mirrors
+>   (`REMOTE_CONTENT_STALE_S=30`) + tolerant rebuild via `_SESSION_DEFAULTS` (only
+>   `session_id`-less records dropped); `+ load_remote_health()` (per-configured-host state:
+>   `ok|missing|stale-mirror|stale-content|auth|unreachable|no-file|garbled`)
+> - `~ ccbar.py` — `_load()` decoupled local/remote reads; local-stale is a prepended dim `⚠`
+>   segment (not an early return); `+ _unhealthy_hosts()` → red `⚠host1,host2 +N` segment;
+>   `_content_stale` frozen-mirror drop
+> - `~ ccdash.py` — `_Section` gains `style`; `_apply` renders bold-red `⚠ <host> — <msg> (age)`
+>   rows (`_HEALTH_MSG`) under `── remote ──`, shown even with zero live remote rows
+> - `~ ccremote-up.sh` / `~ CLAUDE.md` — dead-master → `auth` surfacing documented; module rows
+>   + "Remote monitoring" design bullet updated (two clocks, fail-open-is-not-silent)
+
+### [ccdash-remote-session-monitor.md](plans/completed/ccdash-remote-session-monitor.md)
+`plans/completed/` · 2026-07-01 · touches `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py`
+> Lets this machine's `ccdash`/`ccbar` show Claude sessions running on *other* hosts. Because
+> `claude agents --json` is strictly machine-local, the fix is to *mirror the remote's
+> already-normalized snapshot over* rather than query it: a new `ccremote.py` daemon SSH-copies
+> each configured host's `~/.claude/run/status.json` (the portable `Session[]` contract, **not**
+> `~/.claude.json`, which is mere config) to `run/remote/<host>.json`, and the consumers fold
+> those in via a new `ccstatus.load_remote_sessions()`. Reuses the Mac app's "pull the status
+> file over SSH" idiom ([[ssh-bridge-plan]] / `remote-ssh-stages.md`) but Python-side, keeping
+> the provider local + consumer-side merge discipline of the ignore list. Remote rows are grouped
+> in their **own section** (a `── remote ──` heading in ccdash, a `│`-divided section in ccbar),
+> labeled `host:<name>`; jump/respond/drive stay gated (view-only, since the remote `pane_id` isn't
+> a local pane), but **ack pushes to the host over SSH** (`remote_ack` → the remote's ccstatus
+> recomputes `acknowledged`). A mirror older than ~15s is dropped so a downed host never shows
+> phantom-live rows. The **opposite axis** to the rest of this topic (Mac→remote); here it's this
+> box→remote. Also under topic 1 (it extends the ccstatus/ccdash/ccbar stack).
+>
+> **Key changes:**
+> - `+ ccremote.py` — SSH syncer: `load_hosts`/`_fetch`/`sync_host`/`sync_once`, `--serve` daemon (self-healing) + one-shot CLI, ControlPersist, per-host remote-path + env overrides, stdlib-only fail-open; `remote_ack(host, sid, on)` (ssh touch/rm the remote ack marker, `sid` shell-guarded)
+> - `+ ccremote-up.sh` — launcher: bring up the SSH master once (password/2FA hosts), then `exec ccremote --serve`
+> - `~ ccstatus.py` — `Session.host` field; `load_remote_sessions()` (stale-drop + tolerant `Session(**rec)` rebuild); `REMOTE_DIR`/`REMOTE_STALE_S`; env-overridable `--serve` output paths
+> - `~ ccdash.py` — merge remotes in `load()`; `host:<name>` title + magenta remote-target in `_cells`; `_Section("remote")` heading in `_apply`; `action_ack` pushes over SSH for remote rows; gate jump/compose/drive on `s.host`; peek + `ReaderScreen` skip remote pane capture
+> - `~ ccbar.py` — `_load_remote()` reads/ tags `run/remote/*.json` (stale-drop); `render()` splits local vs remote into `│`-divided sections (`_two_tier`)
+> - `~ CLAUDE.md` — `ccremote.py` module-index row + remote notes + "mirror the remote's status.json" design bullet
+> - `+ ~/.claude/run/ccmonitor-remotes` — hosts file (the headless interface); dir `~/.claude/run/remote/`
 
 ### [ssh-bridge-plan.md](plans/completed/ssh-bridge-plan.md)
 `plans/completed/` · 2026-04-17

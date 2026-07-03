@@ -30,10 +30,11 @@ from pathlib import Path
 # Reuse the provider/sender public seams (stdlib-only; safe under uv's script venv).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccstatus import (  # noqa: E402
-    get_sessions, transcript_path, turns_since_last_user, pending_interaction,
-    load_ignore_patterns, is_ignored,
+    get_sessions, load_remote_sessions, load_remote_health, transcript_path,
+    turns_since_last_user, pending_interaction, load_ignore_patterns, is_ignored,
 )
 from ccsend import enqueue, deliver, drain  # noqa: E402
+import ccremote  # noqa: E402  (remote ack push — reuses ccremote's SSH master)
 
 from rich.console import Group  # noqa: E402
 from rich.rule import Rule  # noqa: E402  (rich Rule — only for the inline glance peek, no bg)
@@ -83,6 +84,29 @@ def _awaiting(s):
 
 def _tier(s):
     return 1 if _awaiting(s) else TIER.get(s.state, 6)
+
+
+class _Section:
+    """An inert text row in the table — a heading (dividing local from remote sessions) or a
+    per-host sync-health warning. Not a Session, so `_selected()` returns None on it and every
+    row action no-ops on it."""
+    def __init__(self, label, style="bold grey58"):
+        self.label = label
+        self.style = style
+
+
+# Broken-sync status line per unhealthy host (states from ccstatus.load_remote_health). Rows
+# from that host silently vanish when its sync breaks, so this line stands in for them —
+# never silence.
+_HEALTH_MSG = {
+    "auth": "auth needed — rerun ccremote-up.sh",
+    "unreachable": "unreachable",
+    "no-file": "no status.json on host",
+    "garbled": "garbled snapshot",
+    "stale-content": "remote ccstatus --serve frozen",
+    "stale-mirror": "syncer down — start ccremote",
+    "missing": "syncer never ran — start ccremote",
+}
 
 # Drive mode: map a Textual key name → the tmux send-keys token. Printable characters
 # (letters, digits, punctuation) aren't here — they ride event.character and go via `-l`.
@@ -223,7 +247,7 @@ class ReaderScreen(ModalScreen):
                                    Text(t["text"], style=color)))
         else:
             yield Static(Text("(no transcript turns found)", style="dim"))
-        if s.pane_id:
+        if s.pane_id and not s.host:     # remote pane_id is the other machine's — don't capture locally
             yield HRule(line_style="dashed")
             yield Static(Text("live pane", style="dim"))
             self.pane_tail = Static(Text(_capture_pane(s.pane_id, lines=200) or "(no pane content)"))
@@ -333,7 +357,9 @@ class CCDash(App):
         # "needs you" marker stays visible under the cursor.
         self.table = DataTable(zebra_stripes=True, cursor_type="row",
                                cursor_foreground_priority="renderable")
-        self.peek = Static("", id="peek", classes="" if self.peek_on else "-off")
+        self.peek_body = Static("")
+        self.peek = VerticalScroll(self.peek_body, id="peek", classes="" if self.peek_on else "-off")
+        self.peek.can_focus = False
         self.filter_input = Input(placeholder="filter title / synopsis / cwd …", id="filter")
         self.compose_input = Input(placeholder="message / answer …", id="compose")
         yield self.table
@@ -355,7 +381,11 @@ class CCDash(App):
     def load(self):
         sessions = get_sessions()
         drain(sessions)         # deliver any outbox inputs dropped by other programs while we're up
-        self.call_from_thread(self._apply, sessions)
+        # Fold in sessions mirrored from other machines (ccremote.py). They carry host != ""
+        # and are view-only: their pane_id is the *remote's* tmux id, meaningless (and possibly
+        # colliding) locally, so every local-tmux path guards on s.host below.
+        sessions = sessions + load_remote_sessions()
+        self.call_from_thread(self._apply, sessions, load_remote_health())
 
     def _ordered(self, sessions):
         if not self.show_dismissed:
@@ -377,7 +407,7 @@ class CCDash(App):
                 s.age_s if s.age_s is not None else 1 << 30))
         return sessions
 
-    def _apply(self, sessions):
+    def _apply(self, sessions, health=None):
         # Drop ignored sessions up front (reloaded each tick so edits take effect live);
         # ccbar mirrors this against the same file. The provider still emits them.
         patterns = load_ignore_patterns()
@@ -387,19 +417,32 @@ class CCDash(App):
         acked = sum(1 for s in sessions if s.acknowledged)
         hidden = sum(1 for s in sessions if s.dismissed)
         yours = sum(1 for s in sessions if _awaiting(s))
-        sessions = self._ordered(sessions)
+        # Local and remote sessions get their own section: order each independently (so the sort
+        # mode + blocked-first tiers apply within each group), then a heading row divides them.
+        local = self._ordered([s for s in sessions if not s.host])
+        remote = self._ordered([s for s in sessions if s.host])
+        # A configured host with broken sync gets a warning line where its rows would be —
+        # rows silently vanishing must never read as "all quiet" (warn-forever; the
+        # ccmonitor-remotes file is the mute).
+        warns = [_Section(f"⚠ {h} — {_HEALTH_MSG.get(rec['state'], rec['state'])}"
+                          + (f" ({fmt_age(int(rec['age_s']))})" if rec.get("age_s") else ""),
+                          style="bold red")
+                 for h, rec in sorted((health or {}).items()) if rec["state"] != "ok"]
+        display = local + ([_Section("── remote ──")] + remote + warns
+                           if remote or warns else [])
+
         prev = None
         if self.rows and 0 <= self.table.cursor_row < len(self.rows):
-            prev = self.rows[self.table.cursor_row].session_id
+            prev = getattr(self.rows[self.table.cursor_row], "session_id", None)
 
-        self.rows = sessions
+        self.rows = display
         self.table.clear()
-        for s in sessions:
-            self.table.add_row(*self._cells(s))
+        for row in display:
+            self.table.add_row(*self._cells(row))
 
         if prev:
-            for i, s in enumerate(sessions):
-                if s.session_id == prev:
+            for i, row in enumerate(display):
+                if getattr(row, "session_id", None) == prev:
                     self.table.move_cursor(row=i)
                     break
         bits = [f"{len(sessions)} session{'s' * (len(sessions) != 1)}"]
@@ -416,6 +459,9 @@ class CCDash(App):
         self._update_peek()
 
     def _cells(self, s):
+        if isinstance(s, _Section):        # inert heading / sync-health warning row
+            return (Text(""), Text(s.label, style=s.style),
+                    Text(""), Text(""), Text(""), Text(""))
         if s.dismissed:
             dot, style, title_style = "·", "strike grey50", "strike grey50"
         elif s.acknowledged:
@@ -426,20 +472,27 @@ class CCDash(App):
             dot, style = STATE_GLYPH.get(s.state, DOT), STATE_STYLE.get(s.state, "")
             title_style = style if s.state == "blocked" else ""
         age_style = "red" if (s.state == "busy" and (s.age_s or 0) > 600) else "dim"
+        title = f"{s.host}:{s.title}" if s.host else s.title   # remote: label `host:<name>`
         return (
             Text(dot, style=style),
-            Text(s.title[:36], style=title_style),
+            Text(title[:36], style=title_style),
             Text(s.synopsis[:64], style="italic dim"),
             Text(s.cwd_short[-30:], style="dim"),
             Text(fmt_age(s.age_s), style=age_style),
-            Text(s.tmux_target or ("bg" if s.kind == "background" else "-"), style="dim"),
+            # remote: the host now rides in the title, so the TMUX column shows the remote's own
+            # tmux target (magenta) — informative but not a local switch-client target.
+            Text(s.tmux_target or ("bg" if s.kind == "background" else "-"),
+                 style="magenta" if s.host else "dim"),
         )
 
     # ── peek panel ───────────────────────────────────────────────────────────
 
     def _selected(self):
         i = self.table.cursor_row
-        return self.rows[i] if self.rows and 0 <= i < len(self.rows) else None
+        if not (self.rows and 0 <= i < len(self.rows)):
+            return None
+        row = self.rows[i]
+        return None if isinstance(row, _Section) else row   # a heading selects nothing
 
     def on_data_table_row_highlighted(self, _event):
         self._update_peek()
@@ -457,29 +510,39 @@ class CCDash(App):
         parts.append(Text(body))
         return Group(*parts)
 
+    def _set_peek(self, renderable):
+        self.peek_body.update(renderable)
+        self.peek.scroll_end(animate=False)
+
     def _update_peek(self):
         if not self.peek_on:
             return
         s = self._selected()
         if not s:
-            self.peek.update("")
+            self.peek_body.update("")
             return
         self.peek.border_title = f"preview · {s.title}"
-        if s.pane_id:
+        if s.host:              # remote pane_id is the other machine's — never capture it locally
+            self._set_peek(self._peek_render(s, f"(remote session on @{s.host} — no local pane)"))
+        elif s.pane_id:
             self._peek_capture(s)
         else:
-            self.peek.update(self._peek_render(s, "(background session — no tmux pane)"))
+            self._set_peek(self._peek_render(s, "(background session — no tmux pane)"))
 
     @work(thread=True, exclusive=True, group="peek")
     def _peek_capture(self, s):
         body = _capture_pane(s.pane_id, lines=12) or "(no pane content)"
-        self.call_from_thread(self.peek.update, self._peek_render(s, body))
+        self.call_from_thread(self._set_peek, self._peek_render(s, body))
 
     # ── actions ──────────────────────────────────────────────────────────────
 
     def action_jump(self):
         s = self._selected()
         if not s:
+            return
+        if s.host:
+            self.notify(f"{s.title}: on @{s.host} — view-only (can't jump remotely)",
+                        severity="warning")
             return
         if not s.pane_id:
             self.notify(f"{s.title}: background session — no tmux pane", severity="warning")
@@ -496,13 +559,35 @@ class CCDash(App):
         self.exit()
 
     def action_ack(self):
-        """Mark the selected session responded-to (mutes its orange marker). Toggles."""
+        """Mark the selected session responded-to (mutes its orange marker). Toggles.
+        Remote rows push the ack to their host over SSH (the remote's ccstatus recomputes
+        `acknowledged`, reflected on the next ~3s sync); local rows touch the local marker."""
         s = self._selected()
         if not s:
+            return
+        if s.host:
+            on = not s.acknowledged
+            self.notify(f"{s.title}: {'acking' if on else 'clearing ack'} on {s.host}…")
+            self._push_remote_ack(s.host, s.session_id, on, s.title)   # threaded — never block the UI
             return
         (_clear if s.acknowledged else _touch)(ACK_DIR, s.session_id)
         self.notify(f"{s.title}: {'un-acked' if s.acknowledged else 'responded-to'}")
         self.load()
+
+    @work(thread=True, group="remote_ack")
+    def _push_remote_ack(self, host, sid, on, title):
+        """Push an ack/un-ack to a remote host over SSH off the event loop — the ssh call can take
+        several seconds, and doing it inline would freeze the TUI. Reports the outcome + refreshes."""
+        ok = ccremote.remote_ack(host, sid, on=on)
+
+        def done():
+            if ok:
+                self.notify(f"{title}: {'acked on' if on else 'ack cleared on'} {host} "
+                            "— updates next sync")
+            else:
+                self.notify(f"{title}: ssh ack to {host} failed", severity="error")
+            self.load()
+        self.call_from_thread(done)
 
     def action_dismiss(self):
         """Hide the selected session from the dashboard. Toggles."""
@@ -523,6 +608,10 @@ class CCDash(App):
         s = self._selected()
         if not s:
             return
+        if s.host:
+            self.notify(f"{s.title}: on @{s.host} — view-only (can't respond remotely yet)",
+                        severity="warning")
+            return
         if not s.pane_id:
             self.notify(f"{s.title}: background session — can't type into it", severity="warning")
             return
@@ -536,6 +625,10 @@ class CCDash(App):
         """Push remote-keyboard mode for the selected pane (multi-select & any menu)."""
         s = self._selected()
         if not s:
+            return
+        if s.host:
+            self.notify(f"{s.title}: on @{s.host} — view-only (can't drive remotely yet)",
+                        severity="warning")
             return
         if not s.pane_id:
             self.notify(f"{s.title}: background session — can't drive it", severity="warning")
