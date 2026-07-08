@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ccstatus import (  # noqa: E402
     get_sessions, load_remote_sessions, load_remote_health, transcript_path,
     turns_since_last_user, pending_interaction, load_ignore_patterns, is_ignored,
+    handed_back, awaiting, touch_marker,
 )
 from ccsend import enqueue, deliver, drain  # noqa: E402
 import ccremote  # noqa: E402  (remote ack push — reuses ccremote's SSH master)
@@ -75,15 +76,9 @@ SORTS = ["state", "age", "title", "cwd"]   # 'state' = provider order (blocked-f
 TIER = {"blocked": 0, "busy": 2, "shell": 3, "idle": 4, "dead": 5}
 
 
-def _awaiting(s):
-    """Idle, Claude has actually responded (engaged), and handed back to you (not yet
-    acked/dismissed) ⇒ 'your turn'. The `engaged` gate keeps a freshly opened, never-answered
-    idle session from showing as a false 'needs you'."""
-    return s.state == "idle" and s.engaged and not s.acknowledged and not s.dismissed
-
-
 def _tier(s):
-    return 1 if _awaiting(s) else TIER.get(s.state, 6)
+    # awaiting (ccstatus): a hand-back you aren't already watching live — the ◆ tier
+    return 1 if awaiting(s) else TIER.get(s.state, 6)
 
 
 class _Section:
@@ -138,15 +133,10 @@ _TMUX_KEY = {
 # (auto-clear when the session writes something new). See ccstatus._marker_active.
 ACK_DIR = Path.home() / ".claude" / "run" / "ack"
 DISMISS_DIR = Path.home() / ".claude" / "run" / "dismissed"
-# A remote ack's real round-trip is ssh touch → remote ccstatus recompute → next mirror
+# A remote mark's real round-trip is ssh touch → remote ccstatus recompute → next mirror
 # (~5-10s); the optimistic overlay covers that window and this TTL bounds a mirror that
 # never catches up (dead sync) so the row's truth eventually wins.
-ACK_OVERLAY_TTL_S = 20.0
-
-
-def _touch(dir_, sid):
-    dir_.mkdir(parents=True, exist_ok=True)
-    (dir_ / sid).touch()        # mtime = now ⇒ marker active until the transcript advances
+OVERLAY_TTL_S = 20.0
 
 
 def _clear(dir_, sid):
@@ -370,10 +360,11 @@ class CCDash(App):
         self.peek_on = False    # off by default — P toggles it on
         self.show_dismissed = False
         self._compose_sid = None   # session a just-opened compose box is bound to
-        # Optimistic ack for remote rows: {(host, sid): (on, expires)}. The real round-trip
-        # (ssh touch → remote recompute → next mirror) takes ~5-10s; the overlay de-oranges
-        # the row instantly and dissolves once the mirror agrees (or on TTL/push failure).
-        self._ack_overlay = {}
+        # Optimistic ack/dismiss for remote rows: {(host, sid, field): (on, expires)},
+        # field ∈ {"acknowledged", "dismissed"}. The real round-trip (ssh touch → remote
+        # recompute → next mirror) takes ~5-10s; the overlay updates the row instantly and
+        # dissolves once the mirror agrees (or on TTL/push failure).
+        self._remote_overlay = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -433,21 +424,22 @@ class CCDash(App):
         return sessions
 
     def _apply(self, sessions, health=None):
-        # Apply unexpired optimistic ack overlays to remote rows; an entry dissolves the
-        # moment the mirror agrees with it, at TTL if the mirror never catches up (dead
+        # Apply unexpired optimistic ack/dismiss overlays to remote rows; an entry dissolves
+        # the moment the mirror agrees with it, at TTL if the mirror never catches up (dead
         # sync — the row's truth must eventually win), or when its session vanishes.
-        if self._ack_overlay:
+        if self._remote_overlay:
             now = time.time()
-            self._ack_overlay = {k: v for k, v in self._ack_overlay.items()
-                                 if now <= v[1]}
+            self._remote_overlay = {k: v for k, v in self._remote_overlay.items()
+                                    if now <= v[1]}
             for s in sessions:
-                ov = self._ack_overlay.get((s.host, s.session_id))
-                if not ov:
-                    continue
-                if s.acknowledged == ov[0]:
-                    self._ack_overlay.pop((s.host, s.session_id), None)
-                else:
-                    s.acknowledged = ov[0]
+                for field in ("acknowledged", "dismissed"):
+                    ov = self._remote_overlay.get((s.host, s.session_id, field))
+                    if not ov:
+                        continue
+                    if getattr(s, field) == ov[0]:
+                        self._remote_overlay.pop((s.host, s.session_id, field), None)
+                    else:
+                        setattr(s, field, ov[0])
         # Drop ignored sessions up front (reloaded each tick so edits take effect live);
         # ccbar mirrors this against the same file. The provider still emits them.
         patterns = load_ignore_patterns()
@@ -456,7 +448,7 @@ class CCDash(App):
             sessions = [s for s in sessions if not is_ignored(s, patterns)]
         acked = sum(1 for s in sessions if s.acknowledged)
         hidden = sum(1 for s in sessions if s.dismissed)
-        yours = sum(1 for s in sessions if _awaiting(s))
+        yours = sum(1 for s in sessions if awaiting(s))
         # Local and remote sessions get their own section: order each independently (so the sort
         # mode + blocked-first tiers apply within each group), then a heading row divides them.
         local = self._ordered([s for s in sessions if not s.host])
@@ -540,7 +532,7 @@ class CCDash(App):
         parts = []
         if s.state == "blocked" and not s.acknowledged:
             parts.append(Text(f"⏳ {s.waiting_for or 'needs you'}", style="bold yellow"))
-        elif _awaiting(s):
+        elif awaiting(s):
             parts.append(Text("↩ your turn — reply, or `a` to mute", style=AWAIT_STYLE))
         parts.append(Text(s.understanding or s.synopsis or "(building understanding…)",
                           style="italic cyan"))
@@ -592,8 +584,10 @@ class CCDash(App):
         except (OSError, subprocess.SubprocessError):
             self.notify("tmux switch-client failed", severity="error")
             return
-        if _awaiting(s):                      # visiting a "your turn" session = handling it;
-            _touch(ACK_DIR, s.session_id)     # blocked (⛔) stays alerting until truly resolved
+        if handed_back(s):                    # visiting a "your turn" session = handling it —
+            touch_marker(ACK_DIR, s.session_id)   # handed_back, not awaiting: the focused row is
+                                              # selectable (the popup overlays it) and must ack too;
+                                              # blocked (⛔) stays alerting until truly resolved
         self.exit()
 
     def action_ack(self):
@@ -605,34 +599,48 @@ class CCDash(App):
             return
         if s.host:
             on = not s.acknowledged
-            # Optimistic: overlay the new state now (the push + mirror round-trip is
-            # seconds); _push_remote_ack reverts the overlay if the ssh fails.
-            self._ack_overlay[(s.host, s.session_id)] = (on, time.time() + ACK_OVERLAY_TTL_S)
-            self.notify(f"{s.title}: {'acked on' if on else 'ack cleared on'} {s.host} — syncing…")
-            self._push_remote_ack(s.host, s.session_id, on, s.title)   # threaded — never block the UI
-            self.load()                        # re-render with the overlay applied
+            self._mark_remote(s, "acknowledged", on,
+                              f"{'acked on' if on else 'ack cleared on'} {s.host}")
             return
-        (_clear if s.acknowledged else _touch)(ACK_DIR, s.session_id)
+        (_clear if s.acknowledged else touch_marker)(ACK_DIR, s.session_id)
         self.notify(f"{s.title}: {'un-acked' if s.acknowledged else 'responded-to'}")
         self.load()
 
-    @work(thread=True, group="remote_ack")
-    def _push_remote_ack(self, host, sid, on, title):
-        """Push an ack/un-ack to a remote host over SSH off the event loop — the ssh call can take
-        several seconds, and doing it inline would freeze the TUI. Reports the outcome + refreshes."""
-        ok = ccremote.remote_ack(host, sid, on=on)
+    def _mark_remote(self, s, field, on, verb):
+        """Toggle a marker on a remote row: overlay the new state now (the push + mirror
+        round-trip is seconds) and push it to the source host; _push_remote_mark reverts
+        the overlay if the ssh fails."""
+        self._remote_overlay[(s.host, s.session_id, field)] = (on, time.time() + OVERLAY_TTL_S)
+        self.notify(f"{s.title}: {verb} — syncing…")
+        self._push_remote_mark(s.host, s.session_id, field, on, s.title)  # threaded — never block the UI
+        self.load()                            # re-render with the overlay applied
+
+    @work(thread=True, group="remote_mark")
+    def _push_remote_mark(self, host, sid, field, on, title):
+        """Push an ack/dismiss marker set/clear to a remote host over SSH off the event loop —
+        the ssh call can take several seconds, and doing it inline would freeze the TUI.
+        Reports the outcome + refreshes."""
+        push = ccremote.remote_ack if field == "acknowledged" else ccremote.remote_dismiss
+        ok = push(host, sid, on=on)
 
         def done():
-            if not ok:                         # revert the optimism — the row re-oranges
-                self._ack_overlay.pop((host, sid), None)
-                self.notify(f"{title}: ssh ack to {host} failed", severity="error")
+            if not ok:                         # revert the optimism — the row's truth returns
+                self._remote_overlay.pop((host, sid, field), None)
+                self.notify(f"{title}: ssh {field} to {host} failed", severity="error")
                 self.load()
         self.call_from_thread(done)
 
     def action_dismiss(self):
-        """Hide the selected session from the dashboard. Toggles."""
+        """Hide the selected session from the dashboard. Toggles. Remote rows push the marker
+        to their host over SSH (like `a`) — the local dismissed dir is never read for a
+        mirrored row, so a local touch would be a silent no-op."""
         s = self._selected()
         if not s:
+            return
+        if s.host:
+            on = not s.dismissed
+            self._mark_remote(s, "dismissed", on,
+                              f"{'dismissed on' if on else 'restored on'} {s.host}")
             return
         (_clear if s.dismissed else _touch)(DISMISS_DIR, s.session_id)
         self.notify(f"{s.title}: {'restored' if s.dismissed else 'dismissed'}")
@@ -718,7 +726,7 @@ class CCDash(App):
         payload = {"type": "text", "text": text, "ts": time.time()}
         enqueue(s.session_id, payload)          # the TUI writes the outbox file (headless contract) …
         if drain([s]):                           # … then delivers + removes it
-            _touch(ACK_DIR, s.session_id)        # responded-to: mute orange (auto-clears on reply)
+            touch_marker(ACK_DIR, s.session_id)  # responded-to: mute orange (auto-clears on reply)
             self.notify(f"sent → {s.title}")
         else:
             self.notify(f"{s.title}: not delivered (no pane?)", severity="warning")

@@ -101,6 +101,10 @@ class Session:
     engaged: bool = False       # transcript has ≥1 assistant turn (Claude has actually
                                 # responded); gates the consumer "your turn" tier so a fresh
                                 # idle session (never answered) isn't mistaken for a hand-back
+    focused: bool = False       # an attached tmux client is viewing this pane right now
+                                # (pane+window active, session attached) — a fact; consumers
+                                # own the policy (suppress ◆ / --serve auto-ack). Fail-open
+                                # False: no tmux / old snapshot ⇒ alert as before
     host: str = ""              # "" = local; set to the SSH host by load_remote_sessions()
                                 # for a session mirrored from another machine (view-only)
 
@@ -200,15 +204,31 @@ def _alive(pid):
 
 # ── Source readers (all fail-open) ───────────────────────────────────────────
 
-def _tmux_panes():
-    """{pane_pid: (pane_id, target)} for every pane on the server."""
-    fmt = "#{pane_pid}\t#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}"
+_PANE_FMT = ("#{pane_pid}\t#{pane_id}\t#{pane_active}\t#{window_active}"
+             "\t#{session_attached}\t#{session_name}:#{window_index}.#{pane_index}")
+
+
+def _parse_panes(output):
+    """{pane_pid: (pane_id, target, focused)} from `list-panes -a -F _PANE_FMT` output.
+    focused = an attached client is looking at this pane RIGHT NOW: active pane of its
+    window AND the window is the session's current one AND ≥1 client attached. The
+    free-text target is last + maxsplit so a tab in a session name can't shift fields.
+    Garbage flags read unfocused — fail-open toward alerting, never toward suppression."""
     panes = {}
-    for line in _run(["tmux", "list-panes", "-a", "-F", fmt]).splitlines():
-        parts = line.split("\t")
-        if len(parts) == 3:
-            panes[parts[0]] = (parts[1], parts[2])
+    for line in output.splitlines():
+        parts = line.split("\t", 5)
+        if len(parts) != 6:
+            continue
+        pid, pane_id, pane_on, win_on, attached, target = parts
+        focused = (pane_on == "1" and win_on == "1"
+                   and attached.isdigit() and int(attached) > 0)
+        panes[pid] = (pane_id, target, focused)
     return panes
+
+
+def _tmux_panes():
+    """{pane_pid: (pane_id, target, focused)} for every pane on the server."""
+    return _parse_panes(_run(["tmux", "list-panes", "-a", "-F", _PANE_FMT]))
 
 
 def _roster_seeds():
@@ -504,8 +524,32 @@ def _marker_active(dir_, sid, transcript_mtime):
     return transcript_mtime is None or mark >= transcript_mtime
 
 
+def touch_marker(dir_, sid):
+    """Set an ack/dismiss touch-marker (mtime = now ⇒ active until the transcript advances
+    past it — see _marker_active). The write side of the marker pair; shared by ccdash's
+    keys and --serve's focused auto-ack."""
+    dir_.mkdir(parents=True, exist_ok=True)
+    (dir_ / sid).touch()
+
+
 def _sort_key(s):
     return (STATE_ORDER.get(s.state, 5), s.age_s if s.age_s is not None else 1 << 30)
+
+
+# ── "Your turn" tier (consumer-side alert policy; ccdash imports it, ccbar mirrors) ──
+
+def handed_back(s):
+    """The raw hand-back: idle, engaged (Claude actually responded), not yet
+    acked/dismissed. What ccdash's jump-ack and --serve's focused auto-ack act on.
+    Requiring state == "idle" is what structurally exempts blocked (⛔) from both."""
+    return (s.state == "idle" and s.engaged
+            and not s.acknowledged and not s.dismissed)
+
+
+def awaiting(s):
+    """What consumers alert ◆ on: a hand-back you are NOT already watching live.
+    focused defaults False (old snapshot / no tmux) ⇒ fail-open to alerting."""
+    return handed_back(s) and not s.focused
 
 
 # ── Ignore list (consumer-side display policy; the provider never applies it) ──
@@ -745,10 +789,11 @@ def get_sessions():
         alive = _alive(pid)
 
         tmux_target = pane_id = None
+        focused = False
         if pid is not None:
             ppid = _find_pane_pid(str(pid), pane_pids)
             if ppid:
-                pane_id, tmux_target = panes[ppid]
+                pane_id, tmux_target, focused = panes[ppid]
 
         cwd = rec.get("cwd") or ""
         # Age = seconds since the last real turn. We prefer the newest *timestamped* entry in
@@ -795,6 +840,7 @@ def get_sessions():
             acknowledged=_marker_active(ACK_DIR, sid, activity_mtime),
             dismissed=_marker_active(DISMISS_DIR, sid, activity_mtime),
             engaged=engaged,
+            focused=focused,
         ))
 
     out.sort(key=_sort_key)
@@ -872,6 +918,25 @@ def _restart_if_source_changed():
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def _auto_ack_focused(sessions):
+    """POLICY (seen = handled), deliberately in the daemon — the always-on actor, same
+    precedent as _write_status_file's acknowledged⇒idle mapping for the notch. A hand-back
+    that lands while its pane is focused gets the ordinary ack marker (so switching away
+    later doesn't re-raise ◆; auto-clears on the next real turn via _marker_active) and the
+    in-memory row is marked BEFORE the snapshots are written, so ccbar never sees a
+    one-tick unacked focused hand-back. Blocked (⛔) rows are never touched — handed_back
+    requires idle. Skips mirrored rows (their marker lives on their host). Idempotent:
+    next tick acknowledged is already True. NOT in get_sessions — --json is a read API
+    and must not mutate ack state as a side effect of a read."""
+    for s in sessions:
+        if s.focused and not s.host and handed_back(s):
+            try:
+                touch_marker(ACK_DIR, s.session_id)
+            except OSError:
+                continue        # fail-open: an unwritable marker just means ◆ later
+            s.acknowledged = True
+
+
 def _serve(interval):
     print(f"ccstatus --serve: writing {STATUS_FILE} + {STATUS_JSON} every {interval}s",
           file=sys.stderr)
@@ -879,6 +944,7 @@ def _serve(interval):
         _restart_if_source_changed()
         try:
             sessions = get_sessions()
+            _auto_ack_focused(sessions)
             _write_status_file(sessions)
             _write_status_json(sessions)
         except Exception as e:  # never let the daemon die on a transient read

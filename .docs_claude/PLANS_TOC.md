@@ -22,6 +22,8 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-07-08** — [focused-pane-quiet-your-turn.md](plans/completed/focused-pane-quiet-your-turn.md) `completed`
+- **2026-07-03** — [remote-dismiss-push.md](plans/completed/remote-dismiss-push.md) `completed` `bugfix`
 - **2026-07-03** — [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md) `active`
 - **2026-07-01** — [remote-sync-health.md](plans/completed/remote-sync-health.md) `completed`
 - **2026-07-01** — [ccdash-remote-session-monitor.md](plans/completed/ccdash-remote-session-monitor.md) `completed`
@@ -52,6 +54,45 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [focused-pane-quiet-your-turn.md](plans/completed/focused-pane-quiet-your-turn.md)
+`plans/completed/` · 2026-07-08 · `ccstatus.py` / `ccbar.py` / `ccdash.py` / `tests/`
+> Silences the ◆ "your turn" alert for the session whose tmux pane the user is *currently
+> viewing* — the "response finished" notification is noise when you're watching it finish
+> live. A new provider fact `Session.focused` (pane active ∧ window active ∧ session
+> attached, from three flags added to the `_tmux_panes` query) feeds a split policy:
+> `awaiting = handed_back ∧ ¬focused` gates ◆ in both consumers, and the `--serve` daemon
+> auto-acks a hand-back that lands focused (**seen = handled** — the ordinary sticky ack
+> marker, so switching away doesn't re-raise; auto-clears on the next real turn). ⛔ blocked
+> is exempt by construction (`handed_back` requires `idle`) and guarded by a regression
+> test. Fail-open: old snapshots/mirrors/no-tmux ⇒ alert as before. Generalizes
+> [[ccdash-jump-autoack-your-turn]] from explicit jump to passive focus.
+>
+> **Key changes:**
+> - `~ ccstatus.py` — `+ _PANE_FMT`/`_parse_panes` (pure), `Session.focused`,
+>   `handed_back`/`awaiting` (shared ◆ policy), `touch_marker`, `_auto_ack_focused` in `_serve`
+> - `~ ccdash.py` — imports the shared predicates/marker (`- _awaiting`, `- _touch`);
+>   jump-ack on `handed_back` (the focused row is selectable under the popup)
+> - `~ ccbar.py` — `_awaiting` mirror gains `not s.get("focused")`
+> - `+ tests/test_your_turn.py` — 30 tests: pane-flag table, two-copy lockstep awaiting
+>   table, ⛔ never-auto-acked guard
+
+### [remote-dismiss-push.md](plans/completed/remote-dismiss-push.md)
+`plans/completed/` · 2026-07-03 · `ccdash.py` / `ccremote.py` / `tests/`
+> Makes `d` (dismiss/hide) work on remote rows — it was a silent no-op: the local
+> `run/dismissed/<sid>` touch is never read for mirrored rows, which are rebuilt from the
+> mirror every tick. Dismiss now pushes to the source host over the shared SSH master exactly
+> like ack, via a shared `_remote_mark` + pure `build_mark_cmd`, and ccdash's optimistic
+> `_ack_overlay` generalizes to a field-keyed `_remote_overlay` covering both markers. Verified
+> live on the stale psc bg-agent ghost (then removed at the source — `claude agents` has no
+> remove command; `rm -rf ~/.claude/jobs/<short>` is the cleanup that drops it from the
+> agents list). Also under topic 4.
+>
+> **Key changes:**
+> - `~ ccremote.py` — `+ build_mark_cmd`/`_remote_mark`/`remote_dismiss`; `remote_ack` → wrapper
+> - `~ ccdash.py` — `action_dismiss` gates on `s.host`; `_remote_overlay[(host,sid,field)]`;
+>   `_push_remote_ack` → `_push_remote_mark`
+> - `+ tests/test_ccremote.py` — mark-cmd construction + bad-sid rejection
 
 ### [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md)
 `plans/active/` · 2026-07-03 · `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `tests/`
@@ -389,6 +430,21 @@ The file-based outbox contract and the single tmux `send-keys` delivery seam tha
 The reverse-SSH-tunnel transport that lets the Mac notch app monitor and control remote Linux
 Claude Code sessions, and the message/permission content that rides it — plus the *opposite
 axis*, one Linux box's Python consumers mirroring another host's sessions over SSH.
+
+### [remote-dismiss-push.md](plans/completed/remote-dismiss-push.md)
+`plans/completed/` · 2026-07-03 · `ccdash.py` / `ccremote.py` / `tests/`
+> Completes the remote-row marker story begun with `remote_ack`: `d`=dismiss on a mirrored row
+> now pushes `touch/rm ~/.claude/run/dismissed/<sid>` to the source host (shared `_remote_mark`
+> over the existing SSH master) instead of silently touching a local file no reader consults,
+> with the optimistic overlay generalized to cover both `acknowledged` and `dismissed`. Born
+> from an undismissable stale orange psc row — a dead daemon-backed background job
+> (`~/.claude/jobs/<short>/`, not just `sessions/<pid>.json`) whose recycled pid still passed
+> the identity check on the daemon's login node; the job was removed at the source as the
+> second half of the fix. Full entry under topic 1.
+>
+> **Key changes:**
+> - `~ ccremote.py` — `+ remote_dismiss` (shared `_remote_mark`, pure `build_mark_cmd`)
+> - `~ ccdash.py` — remote-gated `action_dismiss`, field-keyed `_remote_overlay`
 
 ### [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md)
 `plans/active/` · 2026-07-03 · touches `ccremote.py` / `ccstatus.py` / `ccdash.py` / `ccbar.py` / `tests/`
