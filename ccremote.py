@@ -73,8 +73,8 @@ REMOTES_FILE = Path(os.environ.get("CCMONITOR_REMOTES", str(RUN / "ccmonitor-rem
 # file — for a remote whose $HOME is small/quota'd and writes its snapshot elsewhere (that host
 # must run `CCSTATUS_STATUS_JSON=<path> ccstatus.py --serve` so it writes to the same place).
 REMOTE_STATUS = os.environ.get("CCMONITOR_REMOTE_STATUS", "~/.claude/run/status.json")
-REMOTE_ACK = "~/.claude/run/ack"               # ack dir on the remote (fixed; not the relocatable
-                                               # status.json path) — ssh expands ~
+REMOTE_ACK = "~/.claude/run/ack"               # marker dirs on the remote (fixed; not the
+REMOTE_DISMISS = "~/.claude/run/dismissed"     # relocatable status.json path) — ssh expands ~
 _SID_OK = re.compile(r"[A-Za-z0-9._-]+")       # a session id is a UUID-ish token; reject anything
                                                # else before it reaches a remote shell command
 SSH_TIMEOUT = 20               # subprocess wall-clock ceiling per host. Healthy-psc execs were
@@ -355,22 +355,37 @@ def sync_once(hosts, interval_s=None):
     return {host: fut.result() for host, fut in futures.items()}
 
 
-def remote_ack(host, sid, on=True):
-    """Set (on=True) or clear (on=False) the responded-to marker for a session on a *remote* host,
+def build_mark_cmd(dir_, sid, on):
+    """The remote shell command that sets/clears a touch-file marker `<dir_>/<sid>`. Pure —
+    the caller has already validated `sid` against _SID_OK."""
+    return (f"mkdir -p {dir_} && touch {dir_}/{sid}" if on
+            else f"rm -f {dir_}/{sid}")
+
+
+def _remote_mark(host, sid, dir_, on):
+    """Set (on=True) or clear (on=False) a touch-file marker for a session on a *remote* host,
     over SSH, reusing the shared master (no re-auth). ccdash calls this instead of touching the
-    local ack dir for a mirrored row, so the remote's own ccstatus recomputes `acknowledged` and it
+    local marker dir for a mirrored row, so the remote's own ccstatus recomputes the flag and it
     flows back through the next mirror. Returns True on success, False fail-open (bad sid / ssh
     error). `sid` is validated to a UUID-ish token before it reaches the remote shell."""
     if not _SID_OK.fullmatch(sid or ""):
         return False
-    cmd = (f"mkdir -p {REMOTE_ACK} && touch {REMOTE_ACK}/{sid}" if on
-           else f"rm -f {REMOTE_ACK}/{sid}")
     try:
-        r = subprocess.run(["ssh", *SSH_OPTS, host, cmd],
+        r = subprocess.run(["ssh", *SSH_OPTS, host, build_mark_cmd(dir_, sid, on)],
                            capture_output=True, text=True, timeout=SSH_TIMEOUT)
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def remote_ack(host, sid, on=True):
+    """Set/clear the responded-to marker for a session at its source host."""
+    return _remote_mark(host, sid, REMOTE_ACK, on)
+
+
+def remote_dismiss(host, sid, on=True):
+    """Set/clear the dismissed (hidden-row) marker for a session at its source host."""
+    return _remote_mark(host, sid, REMOTE_DISMISS, on)
 
 
 def _health_key(health):

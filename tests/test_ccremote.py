@@ -186,3 +186,19 @@ def test_load_hosts_grammar(tmp_path):
     assert hosts == [("psc", "/jet/home/jke2/.claude/run/status.json"),
                      ("user@gpu2", ccremote.REMOTE_STATUS)]
     assert load_hosts(tmp_path / "missing") == []
+
+
+# ----------------------------------------------------------- remote markers
+
+def test_build_mark_cmd():
+    assert (ccremote.build_mark_cmd(ccremote.REMOTE_ACK, "abc-123", True)
+            == "mkdir -p ~/.claude/run/ack && touch ~/.claude/run/ack/abc-123")
+    assert (ccremote.build_mark_cmd(ccremote.REMOTE_DISMISS, "abc-123", False)
+            == "rm -f ~/.claude/run/dismissed/abc-123")
+
+
+def test_remote_mark_rejects_bad_sid():
+    # An injection-shaped or empty sid must fail before any ssh is spawned.
+    for sid in ("", None, "x; rm -rf /", "a b", "$(boom)"):
+        assert ccremote.remote_ack("host", sid) is False
+        assert ccremote.remote_dismiss("host", sid) is False
