@@ -176,14 +176,20 @@ def _unhealthy_hosts():
 
 
 def _awaiting(s):
-    """Idle, engaged (Claude has responded), handed back to you (not acked/dismissed), and
-    not the pane you're watching right now (`focused` — seen = handled) ⇒ the ◆ 'your turn'
-    tier. Mirrors ccstatus.awaiting (lockstep table in tests/test_your_turn.py); the
-    `engaged` gate suppresses a fresh never-answered idle session. Old snapshots lack keys
-    → falsy → no false ◆ (engaged) and no false suppression (focused)."""
-    return (s.get("state") == "idle" and s.get("engaged")
-            and not s.get("acknowledged") and not s.get("dismissed")
-            and not s.get("focused"))
+    """The ◆ type 2 (response-complete) tier: Claude's turn is over — state idle, OR
+    busy/shell with turn_complete (lingering background shells/agents pin the CLI status
+    after a hand-back: the yazi bug) — engaged (Claude has responded), not
+    acked/dismissed, and not the pane you're watching right now (`focused` — seen =
+    handled). Mirrors ccstatus.awaiting (lockstep table in tests/test_your_turn.py); the
+    `engaged` gate suppresses a fresh never-answered idle session. Old snapshots lack
+    keys → falsy → no false ◆ (engaged/turn_complete) and no false suppression
+    (focused)."""
+    state = s.get("state")
+    return bool((state == "idle"
+                 or (state in ("busy", "shell") and s.get("turn_complete")))
+                and s.get("engaged")
+                and not s.get("acknowledged") and not s.get("dismissed")
+                and not s.get("focused"))
 
 
 def _load_ignore():

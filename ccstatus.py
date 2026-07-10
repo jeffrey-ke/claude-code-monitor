@@ -20,6 +20,7 @@ Every enrichment is fail-open: a missing/garbled source yields None for that fie
 never an exception (same philosophy as ccmonitor-statusline.py).
 """
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -101,6 +102,10 @@ class Session:
     engaged: bool = False       # transcript has ≥1 assistant turn (Claude has actually
                                 # responded); gates the consumer "your turn" tier so a fresh
                                 # idle session (never answered) isn't mistaken for a hand-back
+    turn_complete: bool = False # the transcript's newest conversational entry is a turn-end
+                                # marker: Claude finished and handed back, even when lingering
+                                # background shells/agents pin the CLI status at busy/shell
+                                # (the yazi bug) — see _turn_complete_step
     focused: bool = False       # an attached tmux client is viewing this pane right now
                                 # (pane+window active, session attached) — a fact; consumers
                                 # own the policy (suppress ◆ / --serve auto-ack). Fail-open
@@ -310,7 +315,8 @@ def _parse_ts(ts):
 
 
 def _transcript_usage(jsonl_path):
-    """(model, ctx_pct, engaged, last_turn_ts) from the transcript tail. Best-effort, tail-only.
+    """(model, ctx_pct, engaged, last_turn_ts, turn_complete) from the transcript tail.
+    Best-effort, tail-only.
 
     `engaged` is True once any assistant turn is seen — i.e. Claude has produced output at
     least once. A genuine "your turn" hand-back always ends with an assistant turn (so it's in
@@ -322,6 +328,9 @@ def _transcript_usage(jsonl_path):
     `file-history-snapshot`, … — carry no `timestamp`, so they don't advance it. This makes it
     the true "last activity" clock, unlike the file's st_mtime which a metadata-only rewrite
     bumps to "now" without any new turn.
+
+    `turn_complete` is the newest conversational entry being a turn-end marker — the
+    per-entry rule lives in _turn_complete_step. Same single tail read, no extra I/O.
     """
     try:
         size = jsonl_path.stat().st_size
@@ -329,14 +338,16 @@ def _transcript_usage(jsonl_path):
             f.seek(max(0, size - 256 * 1024))
             tail = f.read().decode("utf-8", "replace")
     except OSError:
-        return None, None, False, None
-    model = ctx = last_ts = None
+        return None, None, False, None, False
+    model = ctx = last_ts = turn_complete = None
     engaged = False
     for line in reversed(tail.splitlines()):
         try:
             e = json.loads(line)
         except ValueError:
             continue
+        if turn_complete is None:
+            turn_complete = _turn_complete_step(e)       # newest conversational entry decides
         if last_ts is None:
             last_ts = _parse_ts(e.get("timestamp"))      # newest timestamped turn wins
         if not engaged and e.get("type") == "assistant":
@@ -349,9 +360,9 @@ def _transcript_usage(jsonl_path):
             window = 1_000_000 if (model and "[1m]" in model) else 200_000
             ctx = round(100 * used / window, 1) if used else None
             engaged = True
-        if engaged and last_ts is not None:
+        if engaged and last_ts is not None and turn_complete is not None:
             break
-    return model, ctx, engaged, last_ts
+    return model, ctx, engaged, last_ts, bool(turn_complete)
 
 
 def _entry_text(e):
@@ -372,6 +383,37 @@ def _is_genuine_user(e, text):
     envelope. (tool_result turns already fail this — their `text` comes back None.)"""
     return (e.get("type") == "user" and not e.get("isMeta") and not e.get("isSidechain")
             and bool(text) and text.strip() and not _looks_like_wrapper(text))
+
+
+TURN_END_SUBTYPES = ("turn_duration", "stop_hook_summary")   # system entries closing a turn
+
+
+def _turn_complete_step(e):
+    """One vote in the newest→oldest transcript walk: is the turn over?
+
+    Returns True/False when this entry decides it, None to keep walking. The turn is
+    complete ⇔ the newest *conversational* entry is a turn-end marker (system
+    turn_duration / stop_hook_summary — CLI ≥2.1.x writes both after the final assistant
+    message). No vote (skip): untimestamped mutable metadata (custom-title, agent-name,
+    file-history-snapshot…), sidechain entries (background-agent chatter),
+    system/local_command (a /rename or /model run after hand-back must not mask it), and
+    non-genuine user entries (tool_results, <system-reminder>/caveat wrappers). Anything
+    else means the turn is live: a genuine user prompt (Claude is about to run), an
+    assistant entry (mid-generation), or an unrecognized type — fail toward False, i.e.
+    no alert, exactly today's behavior on an old CLI without turn-end markers.
+
+    Known accepted imperfection: a parent auto-resuming after a background task completes
+    can read True for the few seconds before its first assistant entry lands — a brief
+    false ◆ that self-corrects next tick."""
+    if _parse_ts(e.get("timestamp")) is None or e.get("isSidechain"):
+        return None
+    t = e.get("type")
+    if t == "system":
+        sub = e.get("subtype")
+        return None if sub == "local_command" else sub in TURN_END_SUBTYPES
+    if t == "user" and not _is_genuine_user(e, _entry_text(e)):
+        return None
+    return False
 
 
 def turns_since_last_user(jsonl_path, tail_bytes=512 * 1024, max_turns=40, turn_max=320):
@@ -539,11 +581,14 @@ def _sort_key(s):
 # ── "Your turn" tier (consumer-side alert policy; ccdash imports it, ccbar mirrors) ──
 
 def handed_back(s):
-    """The raw hand-back: idle, engaged (Claude actually responded), not yet
-    acked/dismissed. What ccdash's jump-ack and --serve's focused auto-ack act on.
-    Requiring state == "idle" is what structurally exempts blocked (⛔) from both."""
-    return (s.state == "idle" and s.engaged
-            and not s.acknowledged and not s.dismissed)
+    """The raw type 2 (◆ response-complete) condition: Claude's turn is over, engaged
+    (Claude actually responded), not yet acked/dismissed. "Turn is over" = state idle,
+    OR busy/shell with turn_complete — lingering background shells/agents pin the CLI
+    status at busy/shell after a hand-back (the yazi bug), so the transcript's turn-end
+    markers are the truth there. What ccdash's jump-ack and --serve's focused auto-ack
+    act on. blocked (⛔ type 1) stays structurally exempt from both."""
+    return ((s.state == "idle" or (s.state in ("busy", "shell") and s.turn_complete))
+            and s.engaged and not s.acknowledged and not s.dismissed)
 
 
 def awaiting(s):
@@ -804,7 +849,7 @@ def get_sessions():
         # turn". The last timestamped turn ignores those rewrites; st_mtime is the fallback.
         # (sessions/<pid>.json statusUpdatedAt is unusable — older CLI versions leave it stale.)
         age = model = ctx = None
-        engaged = False
+        engaged = turn_complete = False
         last_ts = None
         jp = _transcript_path(cwd, sid)
         jp_mtime = None
@@ -813,7 +858,7 @@ def get_sessions():
         except OSError:
             pass
         if jp.exists():
-            model, ctx, engaged, last_ts = _transcript_usage(jp)
+            model, ctx, engaged, last_ts, turn_complete = _transcript_usage(jp)
         activity_mtime = last_ts if last_ts is not None else jp_mtime
         if activity_mtime is not None:
             age = int(now - activity_mtime)
@@ -840,6 +885,7 @@ def get_sessions():
             acknowledged=_marker_active(ACK_DIR, sid, activity_mtime),
             dismissed=_marker_active(DISMISS_DIR, sid, activity_mtime),
             engaged=engaged,
+            turn_complete=turn_complete,
             focused=focused,
         ))
 
@@ -937,14 +983,60 @@ def _auto_ack_focused(sessions):
             s.acknowledged = True
 
 
+def _serve_lock():
+    """Exclusive single-writer guard. Two --serve daemons silently race the same
+    status.tmp → os.replace (the loser ENOENT-spams its log every tick — observed live
+    for 10 days in ccserve.log). Flock run/serve.lock and keep the fd open for the
+    process lifetime; a second daemon exits loudly naming the holder. The fd is
+    close-on-exec, so the self-heal re-exec releases and immediately re-acquires it."""
+    RUN.mkdir(parents=True, exist_ok=True)
+    f = open(RUN / "serve.lock", "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        owner = f.read().strip() or "?"
+        sys.exit(f"ccstatus --serve: pid {owner} already holds {RUN / 'serve.lock'} — "
+                 "one snapshot writer only; kill it first or use CCSTATUS_STATUS_FILE/"
+                 "CCSTATUS_STATUS_JSON for an isolated run")
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
+
+def _log_transitions(prev, sessions):
+    """Transitions-only forensic log (ccremote's idiom — never per-tick): one stderr line
+    when a session's (state, turn_complete, awaiting) triple changes, plus a line when a
+    session vanishes. This is the trail that answers "why didn't the ◆ fire" after the
+    fact. Returns the new {sid: triple} map; first sighting of a sid is silent."""
+    now = time.strftime("%H:%M:%S")
+    cur = {}
+    for s in sessions:
+        new = (s.state, s.turn_complete, awaiting(s))
+        old = prev.get(s.session_id)
+        if old is not None and old != new:
+            print(f"{now} {s.short_id} {s.title}: {old[0]}→{new[0]} "
+                  f"turn_complete={new[1]} awaiting={new[2]}", file=sys.stderr)
+        cur[s.session_id] = new
+    for sid, old in prev.items():
+        if sid not in cur:
+            print(f"{now} {sid[:8]}: {old[0]}→gone", file=sys.stderr)
+    return cur
+
+
 def _serve(interval):
+    lock = _serve_lock()   # noqa: F841 — the open fd IS the single-writer guard
     print(f"ccstatus --serve: writing {STATUS_FILE} + {STATUS_JSON} every {interval}s",
           file=sys.stderr)
+    prev = {}
     while True:
         _restart_if_source_changed()
         try:
             sessions = get_sessions()
             _auto_ack_focused(sessions)
+            prev = _log_transitions(prev, sessions)   # after auto-ack: log what consumers see
             _write_status_file(sessions)
             _write_status_json(sessions)
         except Exception as e:  # never let the daemon die on a transient read

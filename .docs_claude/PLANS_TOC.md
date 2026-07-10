@@ -22,6 +22,7 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 
 ## Chronological index
 
+- **2026-07-10** — [turn-complete-type2-alert.md](plans/completed/turn-complete-type2-alert.md) `completed` `bugfix`
 - **2026-07-08** — [focused-pane-quiet-your-turn.md](plans/completed/focused-pane-quiet-your-turn.md) `completed`
 - **2026-07-03** — [remote-dismiss-push.md](plans/completed/remote-dismiss-push.md) `completed` `bugfix`
 - **2026-07-03** — [remote-sync-hysteresis-ghosts.md](plans/active/remote-sync-hysteresis-ghosts.md) `active`
@@ -54,6 +55,32 @@ Legend for Key changes: `+` created · `~` modified · `-` deleted.
 The Python monitoring stack: the `ccstatus.py` provider (normalized `Session[]` source of
 truth) and its consumers — the `ccdash` TUI popup and the `ccbar` tmux status segment — plus
 their tmux wiring.
+
+### [turn-complete-type2-alert.md](plans/completed/turn-complete-type2-alert.md)
+`plans/completed/` · 2026-07-10 · `ccstatus.py` / `ccbar.py` / `tests/` / `CLAUDE.md`
+> Fixes a structurally missed ◆ "your turn" alert (the **yazi bug**, root-caused live):
+> when a turn ends while background shells/agents are still alive, the CLI pins the
+> session status at `shell`/`busy` instead of `idle`, so `handed_back`'s `state == "idle"`
+> gate made the hand-back invisible — Claude asked a question and sat at the prompt for
+> hours with no alert. The provider now derives `Session.turn_complete` from the
+> transcript's turn-end markers (`system/turn_duration`/`stop_hook_summary`; pure
+> `_turn_complete_step` in the same `_transcript_usage` tail read — skips sidechain,
+> local-command, and wrapper entries so a post-hand-back `/rename` can't mask it), and
+> `handed_back` accepts `idle` OR `busy`/`shell`+`turn_complete`. `state` stays
+> as-reported; ⛔ stays exempt; fail-open toward "no alert" on old CLIs. Also names the
+> alert taxonomy (**type 1** = ⛔ intervention, **type 2** = ◆ response-complete) and adds
+> two `--serve` diagnosability pieces: transitions-only `(state, turn_complete, awaiting)`
+> stderr logging and a `run/serve.lock` flock (two daemons had silently raced the snapshot
+> rename for 10 days). Extends [[focused-pane-quiet-your-turn]]'s policy pair.
+>
+> **Key changes:**
+> - `~ ccstatus.py` — `+ _turn_complete_step` (pure) + `TURN_END_SUBTYPES`,
+>   `_transcript_usage` → 5-tuple, `Session.turn_complete`, widened `handed_back`,
+>   `+ _serve_lock` / `+ _log_transitions` in `_serve`
+> - `~ ccbar.py` — `_awaiting` mirror accepts `busy`/`shell` + `turn_complete`
+> - `~ tests/test_your_turn.py` — 6 new lockstep rows, step-vote table, transcript
+>   fixtures (verbatim yazi tail), auto-ack-on-turn-complete case (134 total)
+> - `~ CLAUDE.md` — type 1 / type 2 glossary + turn-completion design bullet
 
 ### [focused-pane-quiet-your-turn.md](plans/completed/focused-pane-quiet-your-turn.md)
 `plans/completed/` · 2026-07-08 · `ccstatus.py` / `ccbar.py` / `ccdash.py` / `tests/`
